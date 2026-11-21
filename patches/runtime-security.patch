@@ -1,0 +1,4908 @@
+diff --git a/src/backend/catalog/heap.c b/src/backend/catalog/heap.c
+index f0a159c1b77..2f7c6b75aef 100644
+--- a/src/backend/catalog/heap.c
++++ b/src/backend/catalog/heap.c
+@@ -54,6 +54,7 @@
+ #include "catalog/pg_tablespace.h"
+ #include "catalog/pg_type.h"
+ #include "catalog/storage.h"
++#include "commands/discreet_metadata.h"
+ #include "commands/tablecmds.h"
+ #include "commands/typecmds.h"
+ #include "common/int.h"
+@@ -1903,6 +1904,11 @@ heap_drop_with_catalog(Oid relid)
+ 	/* ensure that stats are dropped if transaction commits */
+ 	pgstat_drop_relation(rel);
+ 
++	/* Discreet metadata: remove the table's asset records at commit */
++	if (rel->rd_rel->relkind == RELKIND_RELATION ||
++		rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
++		_PGS_Discreet_Metadata_Track(relid);
++
+ 	/*
+ 	 * Close relcache entry, but *keep* AccessExclusiveLock on the relation
+ 	 * until transaction commit.  This ensures no one else will try to do
+diff --git a/src/backend/commands/comment.c b/src/backend/commands/comment.c
+index 771aba2a69f..065135ad94e 100644
+--- a/src/backend/commands/comment.c
++++ b/src/backend/commands/comment.c
+@@ -24,6 +24,7 @@
+ #include "catalog/pg_description.h"
+ #include "catalog/pg_shdescription.h"
+ #include "commands/comment.h"
++#include "commands/discreet_metadata.h"
+ #include "miscadmin.h"
+ #include "utils/builtins.h"
+ #include "utils/fmgroids.h"
+@@ -137,6 +138,10 @@ CommentObject(CommentStmt *stmt)
+ 	if (relation != NULL)
+ 		relation_close(relation, NoLock);
+ 
++	/* Discreet metadata: a column comment can mark it for encryption */
++	if (address.classId == RelationRelationId)
++		_PGS_Discreet_Metadata_Track(address.objectId);
++
+ 	return address;
+ }
+ 
+diff --git a/src/backend/commands/meson.build b/src/backend/commands/meson.build
+index d4b224cb5b8..4a4d02dda04 100644
+--- a/src/backend/commands/meson.build
++++ b/src/backend/commands/meson.build
+@@ -18,6 +18,7 @@ backend_sources += files(
+   'dbcommands.c',
+   'define.c',
+   'discard.c',
++  'discreet_metadata.c',
+   'dropcmds.c',
+   'event_trigger.c',
+   'explain.c',
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index 93ad49e59fd..68ef8bffd32 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -59,6 +59,7 @@
+ #include "catalog/toasting.h"
+ #include "commands/comment.h"
+ #include "commands/defrem.h"
++#include "commands/discreet_metadata.h"
+ #include "commands/event_trigger.h"
+ #include "commands/repack.h"
+ #include "commands/sequence.h"
+@@ -1392,6 +1393,9 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 	 */
+ 	relation_close(rel, NoLock);
+ 
++	/* Discreet metadata: write the table's asset records at commit */
++	_PGS_Discreet_Metadata_Track(relationId);
++
+ 	return address;
+ }
+ 
+diff --git a/src/backend/executor/execMain.c b/src/backend/executor/execMain.c
+index 2519af9e778..39df3597e29 100644
+--- a/src/backend/executor/execMain.c
++++ b/src/backend/executor/execMain.c
+@@ -64,6 +64,18 @@
+ #include "utils/partcache.h"
+ #include "utils/rls.h"
+ #include "utils/snapmgr.h"
++/* #include "executor/discreet_hooks.h" -- R1 now lives in this file (see _PGS_Discreet_R1_Intercept) */
++#include "utils/guc.h"
++#include "utils/builtins.h"
++#include "executor/cpp_logger.h"
++#include "catalog/pg_type.h"
++#include "executor/am_client.h"
++#include "executor/spi.h"
++#include "utils/memutils.h"
++#include "executor/runtime_security.h"
++
++/* Runtime security: defined at the end of this file */
++static void _PGS_RuntimeSecurity_StatementEnd(EState *estate);
+ 
+ 
+ /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
+@@ -344,6 +356,9 @@ standard_ExecutorRun(QueryDesc *queryDesc,
+ 	if (queryDesc->query_instr)
+ 		InstrStart(queryDesc->query_instr);
+ 
++	/* Discreet: logger hook, one line per table in the plan */
++	/* Disabled (replaced by the in-file R1 hook): _PGS_Discreet_LogExecutorRun(queryDesc); */
++
+ 	/*
+ 	 * extract information from the query descriptor and the query feature.
+ 	 */
+@@ -459,6 +474,9 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
+ 	MemoryContextSwitchTo(oldcontext);
+ 
+ 	estate->es_finished = true;
++
++	/* Runtime security: handle the tenant, user and role-asset rows written */
++	_PGS_RuntimeSecurity_StatementEnd(estate);
+ }
+ 
+ /* ----------------------------------------------------------------
+@@ -1702,6 +1720,239 @@ ExecCloseRangeTableRelations(EState *estate)
+ 	}
+ }
+ 
++/* 1. Helper to recursively find scan node types in the plan tree */
++static NodeTag
++_PGS_Discreet_FindScanNodeType(Plan *node)
++{
++	if (node == NULL)
++		return T_Invalid;
++
++	switch (nodeTag(node))
++	{
++		case T_SeqScan:
++		case T_IndexScan:
++		case T_IndexOnlyScan:
++		case T_BitmapHeapScan:
++		case T_BitmapIndexScan:
++		case T_SubqueryScan:
++		case T_FunctionScan:
++		case T_NestLoop:
++		case T_HashJoin:
++		case T_MergeJoin:
++			return nodeTag(node);
++		default:
++			break;
++	}
++
++	if (node->lefttree != NULL)
++	{
++		NodeTag tag = _PGS_Discreet_FindScanNodeType(node->lefttree);
++		if (tag != T_Invalid)
++			return tag;
++	}
++
++	if (node->righttree != NULL)
++	{
++		NodeTag tag = _PGS_Discreet_FindScanNodeType(node->righttree);
++		if (tag != T_Invalid)
++			return tag;
++	}
++
++	return T_Invalid;
++}
++
++/* 2. Helper to map node tags to readable strings */
++static const char *
++_PGS_Discreet_GetScanTypeFromTag(NodeTag tag)
++{
++	switch (tag)
++	{
++		case T_SeqScan:
++			return "Sequential Scan";
++		case T_IndexScan:
++			return "Index Scan";
++		case T_IndexOnlyScan:
++			return "Index-Only Scan";
++		case T_BitmapHeapScan:
++			return "Bitmap Heap Scan";
++		case T_BitmapIndexScan:
++			return "Bitmap Index Scan";
++		case T_SubqueryScan:
++			return "Subquery Scan";
++		case T_NestLoop:
++			return "Nested Loop Join";
++		case T_HashJoin:
++			return "Hash Join";
++		case T_MergeJoin:
++			return "Merge Join";
++		default:
++			return "Projected / Execution Root";
++	}
++}
++
++/* 3. Main Interception Function */
++
++static void
++_PGS_Discreet_R1_Intercept(QueryDesc *queryDesc, TupleTableSlot *slot, uint64 row_num)
++{
++    TupleDesc tupdesc = slot->tts_tupleDescriptor;
++    PlannedStmt *stmt = queryDesc != NULL ? queryDesc->plannedstmt : NULL;
++    StringInfoData buf;
++    StringInfoData tables_buf;
++    int i;
++    const char *app_user = NULL;
++    const char *tenant = NULL;
++    const char *req_id = NULL;
++    const char *scan_type = "Unknown Scan";
++
++    initStringInfo(&buf);
++    initStringInfo(&tables_buf);
++
++    /* Determine scan/join type from plan tree traversal */
++    if (stmt != NULL && stmt->planTree != NULL)
++    {
++        NodeTag scan_tag = _PGS_Discreet_FindScanNodeType(stmt->planTree);
++        scan_type = _PGS_Discreet_GetScanTypeFromTag(scan_tag);
++    }
++
++    /* Retrieve application identity and request metadata */
++    app_user = GetConfigOption("discreet.app_user", true, false);
++    tenant = GetConfigOption("discreet.tenant", true, false);
++    req_id = GetConfigOption("discreet.request_id", true, false);
++
++    /* Determine target relation(s) from query plan */
++    if (stmt != NULL && stmt->relationOids != NIL)
++    {
++        ListCell *lc;
++        bool first = true;
++
++        foreach(lc, stmt->relationOids)
++        {
++            Oid relOid = lfirst_oid(lc);
++            char *rname = get_rel_name(relOid);
++
++            if (!first)
++                appendStringInfoString(&tables_buf, ", ");
++
++            appendStringInfo(&tables_buf, "%s (OID: %u)",
++                             rname ? rname : "unknown",
++                             (unsigned int) relOid);
++
++            first = false;
++
++            if (rname != NULL)
++                pfree(rname);
++        }
++    }
++    else
++    {
++        appendStringInfoString(&tables_buf, "(Virtual/Expression)");
++    }
++
++    /* Ensure all slot attributes are available */
++    slot_getallattrs(slot);
++
++    /* Build row-level log header */
++    appendStringInfo(&buf,
++                     "[DISCREET_R1] READ row %llu | Scan Type: %s | Table: %s",
++                     (unsigned long long) row_num,
++                     scan_type,
++                     tables_buf.data);
++
++    /* Log each column's actual value */
++    for (i = 0; i < tupdesc->natts; i++)
++    {
++        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++        bool isnull = slot->tts_isnull[i];
++        char *typname = format_type_be(attr->atttypid);
++        char *value_str;
++
++        if (isnull)
++        {
++            value_str = pstrdup("NULL");
++        }
++        else
++        {
++            Oid typoutput;
++            bool typisvarlena;
++
++            getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
++
++            value_str = OidOutputFunctionCall(
++                typoutput,
++                slot->tts_values[i]
++            );
++        }
++
++        /* Log BEFORE_READ only */
++        if (app_user != NULL && app_user[0] != '\0')
++        {
++            ereport(LOG,
++                    (errmsg("[DISCREET_R1] READ_OP\n"
++                            "table: %s\n"
++                            "attnum: %d\n"
++                            "attribute: %s\n"
++                            "type: %s\n"
++                            "value: %s\n"
++                            "app_user: %s\n"
++                            "tenant: %s\n"
++                            "request_id: %s\n"
++                            "validated: true",
++                            tables_buf.data,
++                            i + 1,
++                            NameStr(attr->attname),
++                            typname,
++                            value_str,
++                            app_user,
++                            tenant ? tenant : "none",
++                            req_id ? req_id : "none")));
++        }
++        else
++        {
++            ereport(LOG,
++                    (errmsg("[DISCREET_R1] READ_OP\n"
++                            "table: %s\n"
++                            "attnum: %d\n"
++                            "attribute: %s\n"
++                            "type: %s\n"
++                            "value: %s\n"
++                            "validated: false",
++                            tables_buf.data,
++                            i + 1,
++                            NameStr(attr->attname),
++                            typname,
++                            value_str)));
++        }
++
++        /* Free allocated strings */
++        if (value_str != NULL)
++            pfree(value_str);
++
++        pfree(typname);
++    }
++
++    /* Append application identity to the row-level log */
++    if (app_user != NULL && app_user[0] != '\0')
++    {
++        appendStringInfo(&buf,
++                         " | app_user: %s | tenant: %s | request_id: %s | validated: true",
++                         app_user,
++                         tenant ? tenant : "none",
++                         req_id ? req_id : "none");
++    }
++    else
++    {
++        appendStringInfoString(&buf, " | validated: false");
++    }
++
++    /* Write row-level log */
++    elog(LOG, "%s", buf.data);
++
++    /* Release buffers */
++    pfree(buf.data);
++    pfree(tables_buf.data);
++}
++
+ /* ----------------------------------------------------------------
+  *		ExecutePlan
+  *
+@@ -1789,6 +2040,18 @@ ExecutePlan(QueryDesc *queryDesc,
+ 		 */
+ 		if (sendTuples)
+ 		{
++			/* Discreet R1: inspect the result row before it is sent, then the C++ logger */
++			/* Disabled (hooks off):
++			if (slot && !TupIsNull(slot))
++			{
++				_PGS_Discreet_R1_Intercept(queryDesc, slot, current_tuple_count + 1);
++				_PGS_myCppFunction((int) (current_tuple_count + 1));
++			}
++			*/
++
++			/* Discreet R1: return integer columns -10, as the client wrote them */
++			/* Disabled (integer shift off): _PGS_Discreet_R1_Unshift(queryDesc, slot, current_tuple_count + 1); */
++
+ 			/*
+ 			 * If we are not able to send the tuple, we assume the destination
+ 			 * has closed and no more tuples can be sent. If that's the case,
+@@ -3296,3 +3559,617 @@ EvalPlanQualEnd(EPQState *epqstate)
+ 	epqstate->relsubs_done = NULL;
+ 	epqstate->relsubs_blocked = NULL;
+ }
++
++/* ----------------------------------------------------------------
++ *	   Runtime security: handle the caught rows, send to AM
++ *
++ * The tables are the Secure-ERMS ones (merged/01_schema.sql).
++ * nodeModifyTable.c catches their rows (_PGS_RuntimeSecurity_CaptureRow);
++ * at the end of each statement standard_ExecutorFinish() calls
++ * _PGS_RuntimeSecurity_StatementEnd(), which reads the rows back with SPI
++ * and:
++ *
++ *	INSERT INTO tenants              queues the tenant for AM
++ *	INSERT INTO user_accounts        queues the user for AM (username, role
++ *	                                 from employees -> roles, display name)
++ *	UPDATE ... SET login_status = 1  login, if the account and its tenant
++ *	                                 are ACTIVE: user_asset_map gets a row per
++ *	                                 protected type the role may use
++ *	                                 (role_protected_type_permissions) and
++ *	                                 asset_key = the 32-byte key AM returns
++ *	UPDATE ... SET login_status = 0, or an account that is not ACTIVE
++ *	                                 logout: the user's asset keys are removed
++ *	UPDATE tenants SET status        a DISABLED tenant: every key of its users
++ *	                                 is removed
++ *	role / protected-type tables changed
++ *	                                 queues the whole matrix for AM
++ *
++ * The queue is sent when the transaction commits, so a rolled-back
++ * statement or savepoint sends nothing.  The HTTP calls are in
++ * am_client.cpp.
++ * ----------------------------------------------------------------
++ */
++
++/*
++ * asset_key in user_asset_map: a 32-byte key, base64 (44 characters: 43
++ * and one '='). AM values of any other size are not stored.
++ */
++#define RSC_KEY_BYTES 32
++#define RSC_KEY_PATTERN "^[A-Za-z0-9+/]{43}=$"
++
++/* A row caught in ExecModifyTable, handled at the end of its statement */
++typedef struct RscEvent
++{
++	RscEventKind kind;
++	EState	   *estate;			/* statement that wrote the row */
++	int			nestlevel;		/* (sub)transaction that wrote it */
++	char	   *schema;			/* schema of the table written */
++	int64		id;				/* tenant_id or user_id */
++} RscEvent;
++
++/* A call to AM, made when the transaction commits */
++typedef struct RscSend
++{
++	int			nestlevel;
++	const char *endpoint;		/* "tenants", "users" or "roles" */
++	int64		tenant_id;		/* picks the API key; 0 = default key */
++	char	   *body;
++} RscSend;
++
++/* Both lists live in TopTransactionContext */
++static List *pending_events = NIL;
++static List *pending_sends = NIL;
++static bool callbacks_registered = false;
++static bool rsc_busy = false;	/* running our own SPI queries */
++
++static void _PGS_rsc_xact_callback(XactEvent event, void *arg);
++static void _PGS_rsc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
++								 SubTransactionId parentSubid, void *arg);
++
++/*
++ * Called by _PGS_RuntimeSecurity_CaptureRow() (nodeModifyTable.c) for each row of
++ * the tenant, user and role-asset tables: remember it until the end of its
++ * statement.  The events live in TopTransactionContext.
++ */
++void
++_PGS_RuntimeSecurity_AddEvent(RscEventKind kind, EState *estate, Relation rel, int64 id)
++{
++	MemoryContext oldcxt;
++	RscEvent   *ev;
++
++	if (rsc_busy)				/* our own SPI queries */
++		return;
++
++	if (kind == RSC_MATRIX_CHANGED)
++	{
++		ListCell   *lc;
++
++		/* One matrix event per statement is enough */
++		foreach(lc, pending_events)
++		{
++			RscEvent   *e = (RscEvent *) lfirst(lc);
++
++			if (e->kind == RSC_MATRIX_CHANGED && e->estate == estate)
++				return;
++		}
++	}
++
++	if (!callbacks_registered)
++	{
++		RegisterXactCallback(_PGS_rsc_xact_callback, NULL);
++		RegisterSubXactCallback(_PGS_rsc_subxact_callback, NULL);
++		callbacks_registered = true;
++	}
++
++	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	ev = palloc(sizeof(RscEvent));
++	ev->kind = kind;
++	ev->estate = estate;
++	ev->nestlevel = GetCurrentTransactionNestLevel();
++	ev->schema = get_namespace_name(RelationGetNamespace(rel));
++	ev->id = id;
++	pending_events = lappend(pending_events, ev);
++	MemoryContextSwitchTo(oldcxt);
++}
++
++/* ---------------------------------------------------------------- SPI */
++
++/* Run a query with $1 = id (bigint) and, if given, $2 = arg (text) */
++static uint64
++_PGS_rsc_exec(const char *sql, int64 id, const char *arg)
++{
++	Oid			types[2] = {INT8OID, TEXTOID};
++	Datum		values[2];
++	int			ret;
++
++	values[0] = Int64GetDatum(id);
++	if (arg != NULL)
++		values[1] = CStringGetTextDatum(arg);
++
++	ret = SPI_execute_with_args(sql, arg != NULL ? 2 : 1, types, values,
++								NULL, false, 0);
++	if (ret < 0)
++		elog(ERROR, "runtime security: query failed (%s): %s",
++			 SPI_result_code_string(ret), sql);
++	return SPI_processed;
++}
++
++/* Column col (1-based) of the first result row, NULL if it is null */
++static char *
++_PGS_rsc_value(int col)
++{
++	return SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, col);
++}
++
++/* Queue a call to AM for commit */
++static void
++_PGS_rsc_queue_send(const char *endpoint, int64 tenant_id, const char *body)
++{
++	MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	RscSend    *s;
++
++	/* The matrix is sent whole, so only its latest version is kept */
++	if (strcmp(endpoint, "roles") == 0)
++	{
++		List	   *keep = NIL;
++		ListCell   *lc;
++
++		foreach(lc, pending_sends)
++		{
++			RscSend    *old = (RscSend *) lfirst(lc);
++
++			if (strcmp(old->endpoint, "roles") != 0)
++				keep = lappend(keep, old);
++		}
++		pending_sends = keep;
++	}
++
++	s = palloc(sizeof(RscSend));
++	s->nestlevel = GetCurrentTransactionNestLevel();
++	s->endpoint = endpoint;
++	s->tenant_id = tenant_id;
++	s->body = pstrdup(body);
++	pending_sends = lappend(pending_sends, s);
++	MemoryContextSwitchTo(oldcxt);
++}
++
++/* ------------------------------------------------------- login / logout */
++
++/*
++ * A protected type the user's role may use: any S/I/U/D permission in
++ * role_protected_type_permissions.  The role is the employee's
++ * (user_accounts -> employees -> role_id).  Format with the schema 4 times.
++ */
++#define RSC_USER_TYPES \
++	"SELECT u.tenant_id, u.user_id, p.type_id FROM %s.user_accounts u" \
++	" JOIN %s.employees e ON e.tenant_id = u.tenant_id" \
++	"  AND e.employee_id = u.employee_id" \
++	" JOIN %s.role_protected_type_permissions p ON p.role_id = e.role_id" \
++	" JOIN %s.protected_type_catalog c ON c.type_id = p.type_id" \
++	" WHERE u.user_id = $1" \
++	" AND (p.can_select OR p.can_insert OR p.can_update OR p.can_delete)"
++
++/*
++ * Login (login_status 1, account and tenant ACTIVE): user_asset_map gets a
++ * row per protected type of the user's role, and asset_key = the value AM
++ * returns for that type.
++ */
++static void
++_PGS_rsc_login(const char *q, int64 user_id, int64 tenant_id, const char *username)
++{
++	char	   *response = NULL;
++	char		errbuf[256];
++	int			status;
++	uint64		n;
++	uint64		bad;
++
++	/* Types the role no longer grants */
++	_PGS_rsc_exec(psprintf("DELETE FROM %s.user_asset_map k "
++					  "WHERE k.user_id = $1 AND k.type_id NOT IN ("
++					  "SELECT t.type_id FROM (" RSC_USER_TYPES ") t)",
++					  q, q, q, q, q), user_id, NULL);
++	/* A row per type of the role */
++	_PGS_rsc_exec(psprintf("INSERT INTO %s.user_asset_map (tenant_id, user_id, type_id) "
++					  RSC_USER_TYPES " ON CONFLICT (user_id, type_id) DO NOTHING",
++					  q, q, q, q, q), user_id, NULL);
++	/* No key from an earlier session survives */
++	_PGS_rsc_exec(psprintf("UPDATE %s.user_asset_map SET asset_key = NULL "
++					  "WHERE user_id = $1 AND asset_key IS NOT NULL", q),
++			 user_id, NULL);
++
++	status = _PGS_AmClient_Call("user_assets", username, tenant_id, NULL,
++						   &response, errbuf, sizeof(errbuf));
++	if (status == 0)
++	{
++		ereport(LOG,
++				(errmsg("runtime security: login of user %lld: AM is not configured (am_client.conf), no asset keys stored",
++						(long long) user_id)));
++		_PGS_AmClient_Free(response);
++		return;
++	}
++	if (status != 200 || response == NULL)
++	{
++		ereport(WARNING,
++				(errmsg("runtime security: login of user %lld: could not get the asset values from AM",
++						(long long) user_id),
++				 status < 0 ? errdetail("%s", errbuf) :
++				 errdetail("AM answered HTTP %d.", status)));
++		_PGS_AmClient_Free(response);
++		return;
++	}
++
++	/* PostgreSQL parses AM's JSON: data.assets[] {name, value} */
++	_PGS_rsc_exec("SELECT 1 WHERE pg_input_is_valid($2, 'jsonb')", user_id, response);
++	if (SPI_processed == 0)
++	{
++		ereport(WARNING,
++				(errmsg("runtime security: login of user %lld: AM's answer is not valid JSON",
++						(long long) user_id)));
++		_PGS_AmClient_Free(response);
++		return;
++	}
++	/* AM names each asset by its protected type id (A01 ...) */
++	n = _PGS_rsc_exec(psprintf("UPDATE %s.user_asset_map k SET asset_key = a.value "
++						  "FROM jsonb_to_recordset("
++						  " CASE WHEN jsonb_typeof($2::jsonb #> '{data,assets}') = 'array'"
++						  " THEN $2::jsonb #> '{data,assets}' ELSE '[]' END)"
++						  " AS a(name text, value text) "
++						  "WHERE k.user_id = $1 AND k.type_id = a.name"
++						  " AND a.value ~ '" RSC_KEY_PATTERN "'",
++						  q), user_id, response);
++	/* Values AM sent that are not a 32-byte key: refused, not truncated */
++	bad = _PGS_rsc_exec("SELECT 1 FROM jsonb_to_recordset("
++						 " CASE WHEN jsonb_typeof($2::jsonb #> '{data,assets}') = 'array'"
++						 " THEN $2::jsonb #> '{data,assets}' ELSE '[]' END)"
++						 " AS a(name text, value text) "
++						 "WHERE a.value IS NOT NULL"
++						 " AND a.value !~ '" RSC_KEY_PATTERN "'", user_id, response);
++	_PGS_AmClient_Free(response);
++	if (bad > 0)
++		ereport(WARNING,
++				(errmsg("runtime security: login of user %lld: %llu asset values from AM are not %d-byte keys, not stored",
++						(long long) user_id, (unsigned long long) bad, RSC_KEY_BYTES)));
++
++	ereport(LOG,
++			(errmsg("runtime security: login of user %lld: %llu asset keys stored",
++					(long long) user_id, (unsigned long long) n)));
++}
++
++/* Logout (login_status 0, or the account is no longer ACTIVE): remove keys */
++static void
++_PGS_rsc_logout(const char *q, int64 user_id)
++{
++	uint64		n;
++
++	n = _PGS_rsc_exec(psprintf("UPDATE %s.user_asset_map SET asset_key = NULL "
++						  "WHERE user_id = $1 AND asset_key IS NOT NULL", q),
++				 user_id, NULL);
++	ereport(LOG,
++			(errmsg("runtime security: logout of user %lld: %llu asset keys removed",
++					(long long) user_id, (unsigned long long) n)));
++}
++
++/* --------------------------------------------------------------- events */
++
++/*
++ * A new tenant in the shape of AM's POST /api/admin/tenants: its slug (the
++ * org code in lower case) and name.  The AM client adds the tenant's first
++ * admin from am_client.conf.
++ */
++static void
++_PGS_rsc_tenant_created(const char *q, int64 tenant_id)
++{
++	if (_PGS_rsc_exec(psprintf("SELECT json_build_object("
++						  "'slug', lower(org_code), 'name', org_name)::text "
++						  "FROM %s.tenants WHERE tenant_id = $1", q),
++				 tenant_id, NULL) == 0)
++		return;					/* not inserted after all (ON CONFLICT) */
++	_PGS_rsc_queue_send("tenants", tenant_id, _PGS_rsc_value(1));
++}
++
++/* A tenant set to DISABLED: none of its users keeps an asset key */
++static void
++_PGS_rsc_tenant_status(const char *q, int64 tenant_id)
++{
++	uint64		n;
++
++	if (_PGS_rsc_exec(psprintf("SELECT status FROM %s.tenants WHERE tenant_id = $1", q),
++				 tenant_id, NULL) == 0 ||
++		strcmp(_PGS_rsc_value(1), "ACTIVE") == 0)
++		return;
++	n = _PGS_rsc_exec(psprintf("UPDATE %s.user_asset_map SET asset_key = NULL "
++						  "WHERE tenant_id = $1 AND asset_key IS NOT NULL", q),
++				 tenant_id, NULL);
++	ereport(LOG,
++			(errmsg("runtime security: tenant %lld is not ACTIVE: %llu asset keys removed",
++					(long long) tenant_id, (unsigned long long) n)));
++}
++
++static void
++_PGS_rsc_user_created(const char *q, int64 user_id)
++{
++	int64		tenant_id;
++
++	if (_PGS_rsc_exec(psprintf("SELECT json_build_object("
++						  "'username', u.username, 'role', r.role_name,"
++						  " 'displayName', e.first_name || ' ' || e.last_name)::text,"
++						  " u.tenant_id, u.login_status "
++						  "FROM %s.user_accounts u"
++						  " JOIN %s.employees e ON e.tenant_id = u.tenant_id"
++						  "  AND e.employee_id = u.employee_id"
++						  " LEFT JOIN %s.roles r ON r.role_id = e.role_id "
++						  "WHERE u.user_id = $1", q, q, q),
++				 user_id, NULL) == 0)
++		return;
++	tenant_id = pg_strtoint64(_PGS_rsc_value(2));
++	_PGS_rsc_queue_send("users", tenant_id, _PGS_rsc_value(1));
++
++	/*
++	 * AM only knows the user after commit, so a user created already logged
++	 * in gets the map rows now and the keys at the next login.
++	 */
++	if (strcmp(_PGS_rsc_value(3), "1") == 0)
++	{
++		_PGS_rsc_exec(psprintf("INSERT INTO %s.user_asset_map (tenant_id, user_id, type_id) "
++						  RSC_USER_TYPES " ON CONFLICT (user_id, type_id) DO NOTHING",
++						  q, q, q, q, q), user_id, NULL);
++		ereport(NOTICE,
++				(errmsg("runtime security: user %lld was created with login_status 1; asset keys are stored at the next login",
++						(long long) user_id)));
++	}
++}
++
++static void
++_PGS_rsc_user_status(const char *q, int64 user_id)
++{
++	bool		logged_in;
++	bool		active;
++	int64		tenant_id;
++	char	   *username;
++
++	if (_PGS_rsc_exec(psprintf("SELECT u.login_status, u.tenant_id, u.username,"
++						  " (u.status = 'ACTIVE' AND t.status = 'ACTIVE')::text "
++						  "FROM %s.user_accounts u"
++						  " JOIN %s.tenants t ON t.tenant_id = u.tenant_id "
++						  "WHERE u.user_id = $1", q, q),
++				 user_id, NULL) == 0)
++		return;
++	logged_in = strcmp(_PGS_rsc_value(1), "1") == 0;
++	tenant_id = pg_strtoint64(_PGS_rsc_value(2));
++	username = _PGS_rsc_value(3);
++	active = strcmp(_PGS_rsc_value(4), "true") == 0;
++
++	if (logged_in && active)
++		_PGS_rsc_login(q, user_id, tenant_id, username);
++	else
++	{
++		if (logged_in)
++			ereport(WARNING,
++					(errmsg("runtime security: user %lld is logged in but the account or its tenant is not ACTIVE; no asset keys",
++							(long long) user_id)));
++		_PGS_rsc_logout(q, user_id);
++	}
++}
++
++/*
++ * The role / protected-type matrix in the shape of AM's role/asset map
++ * (POST /api/admin/role-asset-map): each role name with the protected type
++ * ids (A01 ...) it may use, [] for none.  The S/I/U/D permissions stay in
++ * role_protected_type_permissions; AM is not sent them.
++ */
++static void
++_PGS_rsc_matrix_changed(const char *q)
++{
++	_PGS_rsc_exec(psprintf("SELECT coalesce(json_object_agg(r.role_name,"
++					  "  coalesce((SELECT json_agg(p.type_id ORDER BY p.type_id)"
++					  "    FROM %s.role_protected_type_permissions p"
++					  "    JOIN %s.protected_type_catalog c ON c.type_id = p.type_id"
++					  "    WHERE p.role_id = r.role_id"
++					  "    AND (p.can_select OR p.can_insert OR p.can_update OR p.can_delete)), '[]')"
++					  " ORDER BY r.role_id), '{}')::text "
++					  "FROM %s.roles r",
++					  q, q, q), 0, NULL);
++	_PGS_rsc_queue_send("roles", 0, _PGS_rsc_value(1));
++}
++
++static void
++_PGS_rsc_process(List *events)
++{
++	ListCell   *lc;
++
++	rsc_busy = true;
++	PG_TRY();
++	{
++		if (SPI_connect() != SPI_OK_CONNECT)
++			elog(ERROR, "runtime security: SPI_connect failed");
++
++		foreach(lc, events)
++		{
++			RscEvent   *ev = (RscEvent *) lfirst(lc);
++			const char *q = quote_identifier(ev->schema);
++
++			switch (ev->kind)
++			{
++				case RSC_TENANT_CREATED:
++					_PGS_rsc_tenant_created(q, ev->id);
++					break;
++				case RSC_USER_CREATED:
++					_PGS_rsc_user_created(q, ev->id);
++					break;
++				case RSC_USER_STATUS:
++					_PGS_rsc_user_status(q, ev->id);
++					break;
++				case RSC_MATRIX_CHANGED:
++					_PGS_rsc_matrix_changed(q);
++					break;
++				case RSC_TENANT_STATUS:
++					_PGS_rsc_tenant_status(q, ev->id);
++					break;
++			}
++		}
++
++		SPI_finish();
++	}
++	PG_FINALLY();
++	{
++		rsc_busy = false;
++	}
++	PG_END_TRY();
++}
++
++/*
++ * Called by standard_ExecutorFinish(): handle the rows this statement
++ * caught.
++ */
++static void
++_PGS_RuntimeSecurity_StatementEnd(EState *estate)
++{
++	List	   *mine = NIL;
++	List	   *rest = NIL;
++	ListCell   *lc;
++	MemoryContext oldcxt;
++
++	if (pending_events == NIL || rsc_busy)
++		return;
++
++	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	foreach(lc, pending_events)
++	{
++		RscEvent   *ev = (RscEvent *) lfirst(lc);
++
++		if (ev->estate == estate)
++			mine = lappend(mine, ev);
++		else
++			rest = lappend(rest, ev);
++	}
++	MemoryContextSwitchTo(oldcxt);
++
++	if (mine == NIL)
++		return;
++	pending_events = rest;
++	_PGS_rsc_process(mine);
++}
++
++/* ------------------------------------------------------------- commit */
++
++static void
++_PGS_rsc_send_all(void)
++{
++	ListCell   *lc;
++
++	foreach(lc, pending_sends)
++	{
++		RscSend    *s = (RscSend *) lfirst(lc);
++		char	   *response = NULL;
++		char		errbuf[256];
++		int			status;
++
++		status = _PGS_AmClient_Call(s->endpoint, NULL, s->tenant_id, s->body,
++							   &response, errbuf, sizeof(errbuf));
++		if (status == 0)
++			ereport(LOG,
++					(errmsg("runtime security: AM is not configured (am_client.conf); %s payload written to am_outbox.jsonl",
++							s->endpoint)));
++		else if (status < 0)
++			ereport(WARNING,
++					(errmsg("runtime security: could not send %s to AM: %s",
++							s->endpoint, errbuf)));
++		else if (status >= 200 && status < 300)
++			ereport(LOG,
++					(errmsg("runtime security: sent %s to AM (HTTP %d)",
++							s->endpoint, status)));
++		else
++			ereport(WARNING,
++					(errmsg("runtime security: AM refused %s (HTTP %d): %.300s",
++							s->endpoint, status, response ? response : "")));
++		_PGS_AmClient_Free(response);
++	}
++}
++
++static void
++_PGS_rsc_xact_callback(XactEvent event, void *arg)
++{
++	switch (event)
++	{
++		case XACT_EVENT_PRE_COMMIT:
++			/* Rows whose statement did not reach ExecutorFinish */
++			if (pending_events != NIL)
++			{
++				List	   *events = pending_events;
++
++				pending_events = NIL;
++				_PGS_rsc_process(events);
++			}
++			break;
++		case XACT_EVENT_COMMIT:
++			_PGS_rsc_send_all();
++			pending_events = NIL;
++			pending_sends = NIL;
++			break;
++		case XACT_EVENT_PREPARE:
++			if (pending_sends != NIL)
++				ereport(WARNING,
++						(errmsg("runtime security: nothing is sent to AM for a prepared transaction")));
++			pending_events = NIL;
++			pending_sends = NIL;
++			break;
++		case XACT_EVENT_ABORT:
++		case XACT_EVENT_PARALLEL_ABORT:
++			pending_events = NIL;
++			pending_sends = NIL;
++			rsc_busy = false;
++			break;
++		default:
++			break;
++	}
++}
++
++/*
++ * A rolled-back savepoint forgets what it caught; a released one hands it
++ * to its parent.
++ */
++static void
++_PGS_rsc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
++					 SubTransactionId parentSubid, void *arg)
++{
++	int			level = GetCurrentTransactionNestLevel();
++	List	   *events = NIL;
++	List	   *sends = NIL;
++	ListCell   *lc;
++	MemoryContext oldcxt;
++
++	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
++		return;
++
++	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	foreach(lc, pending_events)
++	{
++		RscEvent   *ev = (RscEvent *) lfirst(lc);
++
++		if (ev->nestlevel < level)
++			events = lappend(events, ev);
++		else if (event == SUBXACT_EVENT_COMMIT_SUB)
++		{
++			ev->nestlevel = level - 1;
++			events = lappend(events, ev);
++		}
++	}
++	foreach(lc, pending_sends)
++	{
++		RscSend    *s = (RscSend *) lfirst(lc);
++
++		if (s->nestlevel < level)
++			sends = lappend(sends, s);
++		else if (event == SUBXACT_EVENT_COMMIT_SUB)
++		{
++			s->nestlevel = level - 1;
++			sends = lappend(sends, s);
++		}
++	}
++	MemoryContextSwitchTo(oldcxt);
++
++	pending_events = events;
++	pending_sends = sends;
++	if (event == SUBXACT_EVENT_ABORT_SUB)
++		rsc_busy = false;
++}
+diff --git a/src/backend/executor/meson.build b/src/backend/executor/meson.build
+index dc45be0b2ce..dd2a1444f6c 100644
+--- a/src/backend/executor/meson.build
++++ b/src/backend/executor/meson.build
+@@ -9,6 +9,10 @@ backend_sources += files(
+   'execGrouping.c',
+   'execIndexing.c',
+   'execJunk.c',
++  'discreet_hooks.c',
++  'cpp_logger.cpp',
++  # runtime_security.c is folded into execMain.c and nodeModifyTable.c
++  'am_client.cpp',
+   'execMain.c',
+   'execParallel.c',
+   'execPartition.c',
+diff --git a/src/backend/executor/nodeModifyTable.c b/src/backend/executor/nodeModifyTable.c
+index 558ceece9bb..be6d115f1da 100644
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -75,6 +75,13 @@
+ #include "utils/injection_point.h"
+ #include "utils/rel.h"
+ #include "utils/snapmgr.h"
++/* #include "executor/discreet_hooks.h" -- W1 now lives in this file (see Write hooks) */
++#include "utils/guc.h"
++#include "utils/lsyscache.h"
++#include "catalog/pg_type.h"
++#include "access/sysattr.h"
++#include "parser/parse_relation.h"
++#include "executor/runtime_security.h"
+ 
+ 
+ typedef struct MTTargetRelLookup
+@@ -898,6 +905,13 @@ ExecInsert(ModifyTableContext *context,
+ 
+ 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+ 
++	/* Discreet: logger hook, and W1 on the row as received */
++	/* Disabled (W1 now runs in ExecModifyTable):
++	_PGS_LogExecutorTableInfo("ExecInsert",
++						 RelationGetRelid(resultRelationDesc),
++						 RelationGetRelationName(resultRelationDesc));
++	_PGS_Discreet_W1_Insert(resultRelationDesc, slot, "entry"); */
++
+ 	/*
+ 	 * Open the table's indexes, if we have not done so already, so that we
+ 	 * can add new index entries for the inserted tuple.
+@@ -1118,6 +1132,12 @@ ExecInsert(ModifyTableContext *context,
+ 			  resultRelInfo->ri_TrigDesc->trig_insert_before_row)))
+ 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
+ 
++		/* Discreet W1: store integer columns +10, so "final" logs the shifted row */
++		/* Disabled (integer shift off): _PGS_Discreet_W1_ShiftInsert(mtstate, resultRelInfo, slot); */
++
++		/* Discreet W1: the final row, just before heap and index insertion */
++		/* Disabled (W1 now runs in ExecModifyTable): _PGS_Discreet_W1_Insert(resultRelationDesc, slot, "final"); */
++
+ 		if (onconflict != ONCONFLICT_NONE && resultRelInfo->ri_NumIndices > 0)
+ 		{
+ 			/* Perform a speculative insertion. */
+@@ -1632,6 +1652,13 @@ ExecDelete(ModifyTableContext *context,
+ 							epqreturnslot, tmresult))
+ 		return NULL;
+ 
++	/* Discreet: logger hook, and W1 on the row being deleted */
++	/* Disabled (not in the new W1 hooks):
++	_PGS_LogExecutorTableInfo("ExecDelete",
++						 RelationGetRelid(resultRelationDesc),
++						 RelationGetRelationName(resultRelationDesc));
++	_PGS_Discreet_W1_Delete(resultRelationDesc, tupleid); */
++
+ 	/* INSTEAD OF ROW DELETE Triggers */
+ 	if (resultRelInfo->ri_TrigDesc &&
+ 		resultRelInfo->ri_TrigDesc->trig_delete_instead_row)
+@@ -2326,6 +2353,9 @@ lreplace:
+ 	if (resultRelationDesc->rd_att->constr)
+ 		ExecConstraints(resultRelInfo, slot, estate);
+ 
++	/* Discreet W1: store the integer columns this UPDATE sets +10 */
++	/* Disabled (integer shift off): _PGS_Discreet_W1_ShiftUpdate(resultRelInfo, estate, slot); */
++
+ 	/*
+ 	 * replace the heap tuple
+ 	 *
+@@ -2521,6 +2551,13 @@ ExecUpdate(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
+ 	if (!ExecUpdatePrologue(context, resultRelInfo, tupleid, oldtuple, slot, NULL))
+ 		return NULL;
+ 
++	/* Discreet: logger hook, and W1 on the old and new values */
++	/* Disabled (W1 now runs in ExecModifyTable):
++	_PGS_LogExecutorTableInfo("ExecUpdate",
++						 RelationGetRelid(resultRelationDesc),
++						 RelationGetRelationName(resultRelationDesc));
++	_PGS_Discreet_W1_Update(resultRelationDesc, slot, tupleid); */
++
+ 	/*
+ 	 * If the target tuple was concurrently updated, the trigger code will
+ 	 * have done EPQ and updated tupleid, following the update chain.  In this
+@@ -4381,6 +4418,269 @@ ExecPrepareTupleRouting(ModifyTableState *mtstate,
+ 	return slot;
+ }
+ 
++/* ----------------------------------------------------------------
++ *	   Write hooks
++ * ----------------------------------------------------------------
++ */
++static void _PGS_Discreet_W1_Insert(Relation rel,
++                               TupleTableSlot *slot,
++                               const char *stage)
++{
++
++	TupleDesc tupdesc = slot->tts_tupleDescriptor;
++	StringInfoData buf;
++	int i;
++
++	
++
++	const char *req_id;
++
++	initStringInfo(&buf);
++	req_id = GetConfigOption("discreet.request_id", true, false);
++	slot_getallattrs(slot);
++	
++	
++
++	appendStringInfo(&buf,
++    "[W1] INSERT (%s) | Table: %s (OID: %u) | Request ID: %s",
++    stage,
++    RelationGetRelationName(rel),
++    (unsigned int) RelationGetRelid(rel),
++    (req_id && req_id[0] != '\0') ? req_id : "none");
++
++	for (i = 0; i < tupdesc->natts; i++)
++	{
++	Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++	bool isnull = slot->tts_isnull[i];
++
++	if (isnull)
++	{
++	appendStringInfo(&buf, " | %d (%s): NULL", i + 1, NameStr(attr->attname));
++	}
++	else
++	{
++	Oid typoutput;
++	bool typisvarlena;
++	char *val_str;
++
++	getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
++	val_str = OidOutputFunctionCall(typoutput, slot->tts_values[i]);
++	appendStringInfo(&buf, " | %d (%s): %s", i + 1, NameStr(attr->attname), val_str ? val_str : "");
++	}
++	}
++
++	elog(LOG, "%s", buf.data);
++	pfree(buf.data);
++
++}				
++
++
++static void _PGS_Discreet_W1_Update(Relation rel,
++                               TupleTableSlot *slot,
++                               ItemPointer tupleid)
++{
++
++	TupleDesc tupdesc = slot->tts_tupleDescriptor;
++	TupleTableSlot *oldSlot = NULL;
++	StringInfoData buf;
++	int i;
++
++	const char *req_id;
++
++	initStringInfo(&buf);
++	req_id = GetConfigOption("discreet.request_id", true, false);
++	slot_getallattrs(slot);
++
++	appendStringInfo(&buf,
++    "[W1] UPDATE | Table: %s (OID: %u) | Request ID: %s",
++    RelationGetRelationName(rel),
++    (unsigned int) RelationGetRelid(rel),
++    (req_id && req_id[0] != '\0') ? req_id : "none");
++
++	/* Fetch old row image if possible to compare old and new values */
++	if (tupleid && ItemPointerIsValid(tupleid))
++	{
++	oldSlot = table_slot_create(rel, NULL);
++	if (!table_tuple_fetch_row_version(rel, tupleid, SnapshotAny, oldSlot))
++	{
++	ExecDropSingleTupleTableSlot(oldSlot);
++	oldSlot = NULL;
++	}
++	else
++	{
++	slot_getallattrs(oldSlot);
++	}
++	}
++
++	for (i = 0; i < tupdesc->natts; i++)
++	{
++	Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++	char *new_val = "NULL";
++	char *old_val = "NULL";
++	bool new_null = slot->tts_isnull[i];
++	bool old_null = (oldSlot != NULL) ? oldSlot->tts_isnull[i] : true;
++	Oid typoutput;
++	bool typisvarlena;
++
++	getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
++
++	if (!new_null)
++	new_val = OidOutputFunctionCall(typoutput, slot->tts_values[i]);
++
++	if (oldSlot && !old_null)
++	old_val = OidOutputFunctionCall(typoutput, oldSlot->tts_values[i]);
++
++	/* Report changed column(s) */
++	if (new_null != old_null || (new_val && old_val && strcmp(new_val, old_val) != 0))
++	{
++	appendStringInfo(&buf, " | attnum: %d (%s) old_value: %s new_value: %s",
++			i + 1, NameStr(attr->attname), old_val, new_val);
++	}
++	}
++
++	if (oldSlot)
++	ExecDropSingleTupleTableSlot(oldSlot);
++
++	elog(LOG, "%s", buf.data);
++	pfree(buf.data);
++
++}
++
++
++/* ----------------------------------------------------------------
++ *	   Runtime security: catch the rows of the Secure-ERMS tenant,
++ *	   user account and role / protected-type tables
++ *
++ * ExecModifyTable() calls _PGS_RuntimeSecurity_CaptureRow() for each row it
++ * writes.  The tables are found by name, in any schema that also has a
++ * user_asset_map table (so other databases with tables of the same names,
++ * such as the Secure-ERMS test pack's, are left alone):
++ *
++ *	INSERT INTO tenants / user_accounts      the tenant / user (by id)
++ *	UPDATE tenants that sets status          a disabled tenant
++ *	UPDATE user_accounts that sets login_status or status
++ *	                                         login (1), logout (0), disabled
++ *	any write to roles, protected_type_catalog,
++ *	  role_protected_type_permissions        the matrix changed
++ *
++ * Only the row's id is kept here; standard_ExecutorFinish() (execMain.c)
++ * handles the rows when the statement ends.
++ * ----------------------------------------------------------------
++ */
++static bool
++_PGS_rsc_is_matrix_table(const char *relname)
++{
++	return strcmp(relname, "role_protected_type_permissions") == 0 ||
++		strcmp(relname, "roles") == 0 ||
++		strcmp(relname, "protected_type_catalog") == 0;
++}
++
++/* Only schemas set up for runtime security: they have user_asset_map */
++static bool
++_PGS_rsc_schema_enabled(Relation rel)
++{
++	return OidIsValid(get_relname_relid("user_asset_map",
++										RelationGetNamespace(rel)));
++}
++
++/* Does this UPDATE set the column? */
++static bool
++_PGS_rsc_sets_column(Relation rel, ResultRelInfo *resultRelInfo,
++					 EState *estate, const char *column)
++{
++	AttrNumber	attnum = attnameAttNum(rel, column, false);
++
++	return attnum > 0 &&
++		bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber,
++					  ExecGetUpdatedCols(resultRelInfo, estate));
++}
++
++/* The bigint id column of a captured row, or false if it has none */
++static bool
++_PGS_rsc_row_id(Relation rel, TupleTableSlot *slot, const char *column, int64 *id)
++{
++	AttrNumber	attnum = attnameAttNum(rel, column, false);
++	Datum		value;
++	bool		isnull;
++
++	if (attnum <= 0 || slot == NULL || TupIsNull(slot))
++		return false;
++	value = slot_getattr(slot, attnum, &isnull);
++	if (isnull)
++		return false;
++
++	switch (TupleDescAttr(RelationGetDescr(rel), attnum - 1)->atttypid)
++	{
++		case INT8OID:
++			*id = DatumGetInt64(value);
++			return true;
++		case INT4OID:
++			*id = DatumGetInt32(value);
++			return true;
++		default:
++			return false;
++	}
++}
++
++/*
++ * One row written by ExecModifyTable (slot is the new row; NULL for DELETE
++ * and MERGE).  Rows of any other table return after a name compare.
++ */
++static void
++_PGS_RuntimeSecurity_CaptureRow(ModifyTableState *mtstate,
++						   ResultRelInfo *resultRelInfo,
++						   CmdType operation,
++						   TupleTableSlot *slot)
++{
++	Relation	rel = resultRelInfo->ri_RelationDesc;
++	EState	   *estate = mtstate->ps.state;
++	const char *relname = RelationGetRelationName(rel);
++	int64		id = 0;
++	RscEventKind kind;
++
++	if (!IsNormalProcessingMode())
++		return;
++
++	if (_PGS_rsc_is_matrix_table(relname))
++		kind = RSC_MATRIX_CHANGED;
++	else if (strcmp(relname, "tenants") == 0 && operation == CMD_INSERT)
++	{
++		if (!_PGS_rsc_row_id(rel, slot, "tenant_id", &id))
++			return;
++		kind = RSC_TENANT_CREATED;
++	}
++	else if (strcmp(relname, "tenants") == 0 && operation == CMD_UPDATE)
++	{
++		if (!_PGS_rsc_sets_column(rel, resultRelInfo, estate, "status") ||
++			!_PGS_rsc_row_id(rel, slot, "tenant_id", &id))
++			return;
++		kind = RSC_TENANT_STATUS;
++	}
++	else if (strcmp(relname, "user_accounts") == 0 && operation == CMD_INSERT)
++	{
++		if (!_PGS_rsc_row_id(rel, slot, "user_id", &id))
++			return;
++		kind = RSC_USER_CREATED;
++	}
++	else if (strcmp(relname, "user_accounts") == 0 && operation == CMD_UPDATE)
++	{
++		/* Login / logout (login_status) or the account state (status) */
++		if (!_PGS_rsc_sets_column(rel, resultRelInfo, estate, "login_status") &&
++			!_PGS_rsc_sets_column(rel, resultRelInfo, estate, "status"))
++			return;
++		if (!_PGS_rsc_row_id(rel, slot, "user_id", &id))
++			return;
++		kind = RSC_USER_STATUS;
++	}
++	else
++		return;
++
++	if (!_PGS_rsc_schema_enabled(rel))
++		return;
++
++	_PGS_RuntimeSecurity_AddEvent(kind, estate, rel, id);
++}
++
+ /* ----------------------------------------------------------------
+  *	   ExecModifyTable
+  *
+@@ -4724,6 +5024,17 @@ ExecModifyTable(PlanState *pstate)
+ 				if (unlikely(!resultRelInfo->ri_projectNewInfoValid))
+ 					ExecInitInsertProjection(node, resultRelInfo);
+ 				slot = ExecGetInsertNewTuple(resultRelInfo, context.planSlot);
++				/* DISCREET W1: Log the final INSERT values before persistence */
++				/* Disabled (hooks off):
++				if (slot != NULL && !TupIsNull(slot))
++				{
++					ExecMaterializeSlot(slot);
++					slot_getallattrs(slot);
++					_PGS_Discreet_W1_Insert(resultRelInfo->ri_RelationDesc, slot, "INSERT");
++				}
++				*/
++				/* Runtime security: a tenant, user or role-asset row */
++				_PGS_RuntimeSecurity_CaptureRow(node, resultRelInfo, CMD_INSERT, slot);
+ 				slot = ExecInsert(&context, resultRelInfo, slot,
+ 								  node->canSetTag, NULL, NULL);
+ 				break;
+@@ -4764,6 +5075,19 @@ ExecModifyTable(PlanState *pstate)
+ 				slot = ExecGetUpdateNewTuple(resultRelInfo, context.planSlot,
+ 											 oldSlot);
+ 
++				/* DISCREET W1: Log the changed UPDATE values before persistence */
++				/* Disabled (hooks off):
++				if (slot != NULL && !TupIsNull(slot))
++				{
++					ExecMaterializeSlot(slot);
++					slot_getallattrs(slot);
++					_PGS_Discreet_W1_Update(resultRelInfo->ri_RelationDesc, slot, tupleid);
++				}
++				*/
++
++				/* Runtime security: login/logout (user_accounts.login_status), role / protected-type rows */
++				_PGS_RuntimeSecurity_CaptureRow(node, resultRelInfo, CMD_UPDATE, slot);
++
+ 				/* Now apply the update. */
+ 				slot = ExecUpdate(&context, resultRelInfo, tupleid, oldtuple,
+ 								  oldSlot, slot, node->canSetTag);
+@@ -4773,11 +5097,15 @@ ExecModifyTable(PlanState *pstate)
+ 				break;
+ 
+ 			case CMD_DELETE:
++				/* Runtime security: role-asset rows */
++				_PGS_RuntimeSecurity_CaptureRow(node, resultRelInfo, CMD_DELETE, NULL);
+ 				slot = ExecDelete(&context, resultRelInfo, tupleid, oldtuple,
+ 								  true, false, node->canSetTag, NULL, NULL, NULL);
+ 				break;
+ 
+ 			case CMD_MERGE:
++				/* Runtime security: role-asset rows */
++				_PGS_RuntimeSecurity_CaptureRow(node, resultRelInfo, CMD_MERGE, NULL);
+ 				slot = ExecMerge(&context, resultRelInfo, tupleid, oldtuple,
+ 								 node->canSetTag);
+ 				break;
+diff --git a/src/backend/executor/spi.c b/src/backend/executor/spi.c
+index 196b998dd7f..50724b6237d 100644
+--- a/src/backend/executor/spi.c
++++ b/src/backend/executor/spi.c
+@@ -589,6 +589,17 @@ SPI_inside_nonatomic_context(void)
+ 	return true;
+ }
+ 
++/*
++ * Discreet: is the caller inside an SPI connection (a PL function, trigger
++ * or foreign key check)?  The integer shift in discreet_hooks.c leaves the
++ * SQL run there on stored values.
++ */
++bool
++_PGS_SPI_is_connected(void)
++{
++	return _SPI_current != NULL;
++}
++
+ 
+ /* Parse, plan, and execute a query string */
+ int
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index edaa42d713a..61e794c4818 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -63,6 +63,7 @@
+ #include "utils/lsyscache.h"
+ #include "utils/rel.h"
+ #include "utils/selfuncs.h"
++#include "executor/discreet_hooks.h"
+ 
+ /* GUC parameters */
+ double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
+@@ -341,6 +342,9 @@ planner(Query *parse, const char *query_string, int cursorOptions,
+ {
+ 	PlannedStmt *result;
+ 
++	/* Discreet: client queries use original integer values (stored +10) */
++	/* Disabled (integer shift off): _PGS_Discreet_PlannerRewrite(parse); */
++
+ 	if (planner_hook)
+ 		result = (*planner_hook) (parse, query_string, cursorOptions,
+ 								  boundParams, es);
+diff --git a/src/include/executor/spi.h b/src/include/executor/spi.h
+index c7a3b7abb26..d22846a5cd4 100644
+--- a/src/include/executor/spi.h
++++ b/src/include/executor/spi.h
+@@ -203,5 +203,6 @@ extern void SPI_rollback_and_chain(void);
+ extern void AtEOXact_SPI(bool isCommit);
+ extern void AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid);
+ extern bool SPI_inside_nonatomic_context(void);
++extern bool _PGS_SPI_is_connected(void);	/* Discreet */
+ 
+ #endif							/* SPI_H */
+diff --git a/src/backend/commands/discreet_metadata.c b/src/backend/commands/discreet_metadata.c
+new file mode 100644
+index 00000000000..70e1f81fc38
+--- /dev/null
++++ b/src/backend/commands/discreet_metadata.c
+@@ -0,0 +1,388 @@
++/*-------------------------------------------------------------------------
++ *
++ * discreet_metadata.c
++ *	  Discreet metadata service: asset records for columns marked for
++ *	  encryption in their comment.
++ *
++ * A column is marked with its comment (pg_description):
++ *
++ *	COMMENT ON COLUMN employee.salary IS 'encrypt=yes; desc=Employee salary';
++ *
++ * encrypt takes yes/no (or true/false, on/off, 1/0); desc is optional and,
++ * when present, must come last (it runs to the end of the comment).
++ *
++ * CREATE TABLE (DefineRelation) and COMMENT ON (CommentObject) remember the
++ * table.  When the transaction commits, the service reads the comment of
++ * every column of those tables and writes one asset record per column with
++ * encrypt=yes to metadata.json in the data directory:
++ *
++ *	[
++ *	  {"assetName": "AST-5-16385-3", "assetDescription": "Employee salary",
++ *	   "columnId": 3, "tableId": 16385, "databaseId": 5, "columnName": ...}
++ *	]
++ *
++ * (each record is on one line in the file).  A table's old records are
++ * replaced, so a later COMMENT updates them; records of other tables and
++ * databases are kept.  DROP TABLE (heap_drop_with_catalog) remembers the
++ * table too: it no longer exists at commit, so its records are removed.  Writing at commit means a rolled-back CREATE TABLE
++ * writes nothing, and a table created and commented in one transaction is
++ * written once.
++ *
++ * src/backend/commands/discreet_metadata.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <ctype.h>
++
++#include "access/transam.h"
++#include "access/xact.h"
++#include "catalog/pg_class.h"
++#include "commands/comment.h"
++#include "commands/dbcommands.h"
++#include "commands/discreet_metadata.h"
++#include "common/string.h"
++#include "lib/stringinfo.h"
++#include "miscadmin.h"
++#include "storage/fd.h"
++#include "storage/lock.h"
++#include "utils/builtins.h"
++#include "utils/json.h"
++#include "utils/lsyscache.h"
++#include "utils/memutils.h"
++#include "utils/rel.h"
++
++/* In the data directory, the backend's working directory */
++#define DISCREET_METADATA_FILE		"metadata.json"
++#define DISCREET_METADATA_TMPFILE	"metadata.json.tmp"
++
++/* Tables created or commented on in the current transaction */
++static List *pending_relids = NIL;
++static bool callback_registered = false;
++
++static void _PGS_Discreet_Metadata_XactCallback(XactEvent event, void *arg);
++
++/*
++ * Remember a table created or commented on; its records are written at
++ * commit.  Catalog tables and other relation kinds are filtered there.
++ */
++void
++_PGS_Discreet_Metadata_Track(Oid relid)
++{
++	MemoryContext oldcxt;
++
++	if (!OidIsValid(relid) || relid < FirstNormalObjectId)
++		return;
++
++	if (!callback_registered)
++	{
++		RegisterXactCallback(_PGS_Discreet_Metadata_XactCallback, NULL);
++		callback_registered = true;
++	}
++
++	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	pending_relids = list_append_unique_oid(pending_relids, relid);
++	MemoryContextSwitchTo(oldcxt);
++}
++
++/* Strip leading and trailing white space in place */
++static char *
++_PGS_Discreet_Metadata_Trim(char *s)
++{
++	char	   *end;
++
++	while (isspace((unsigned char) *s))
++		s++;
++	end = s + strlen(s);
++	while (end > s && isspace((unsigned char) end[-1]))
++		end--;
++	*end = '\0';
++	return s;
++}
++
++/*
++ * Read a column comment "encrypt=yes; desc=<text>".  Keys are
++ * case-insensitive; desc (or description) is optional and runs to the end of
++ * the comment.  Returns true when encryption is allowed, with *desc set to
++ * the description or NULL.
++ */
++static bool
++_PGS_Discreet_Metadata_ParseComment(const char *comment, char **desc)
++{
++	char	   *p = pstrdup(comment);
++	bool		encrypt = false;
++
++	*desc = NULL;
++	while (p != NULL)
++	{
++		char	   *next = strchr(p, ';');
++		char	   *eq;
++		char	   *key;
++
++		if (next != NULL)
++			*next++ = '\0';
++
++		eq = strchr(p, '=');
++		if (eq != NULL)
++		{
++			*eq = '\0';
++			key = _PGS_Discreet_Metadata_Trim(p);
++
++			if (pg_strcasecmp(key, "desc") == 0 ||
++				pg_strcasecmp(key, "description") == 0)
++			{
++				char	   *val;
++
++				/* The description is the rest of the comment, ';' included */
++				if (next != NULL)
++					next[-1] = ';';
++				val = _PGS_Discreet_Metadata_Trim(eq + 1);
++				if (*val != '\0')
++					*desc = pstrdup(val);
++				break;
++			}
++
++			if (pg_strcasecmp(key, "encrypt") == 0)
++			{
++				bool		val;
++
++				if (parse_bool(_PGS_Discreet_Metadata_Trim(eq + 1), &val))
++					encrypt = val;
++			}
++		}
++		p = next;
++	}
++
++	return encrypt;
++}
++
++/*
++ * Unique asset name of a column: AST-<databaseId>-<tableId>-<columnId>.
++ * The three ids together are unique in the cluster.
++ */
++static char *
++_PGS_Discreet_Metadata_AssetName(Oid dbid, Oid relid, AttrNumber attnum)
++{
++	return psprintf("AST-%u-%u-%d", dbid, relid, attnum);
++}
++
++/* Append the asset records (JSON, one line each) of one table to *records */
++static void
++_PGS_Discreet_Metadata_CollectTable(Oid relid, List **records)
++{
++	char		relkind = get_rel_relkind(relid);
++	Relation	rel;
++	TupleDesc	tupdesc;
++	char	   *dbname;
++	char	   *tablename;
++
++	/* Dropped (DROP TABLE): no records, so Write() only removes the old ones */
++	if (relkind == '\0')
++	{
++		elog(LOG, "[DISCREET_METADATA] table %u of database %u dropped: its records are removed",
++			 relid, MyDatabaseId);
++		return;
++	}
++
++	/* Not a table (view, sequence, ...) */
++	if (relkind != RELKIND_RELATION && relkind != RELKIND_PARTITIONED_TABLE)
++		return;
++
++	rel = RelationIdGetRelation(relid);
++	if (!RelationIsValid(rel))
++		return;
++
++	tupdesc = RelationGetDescr(rel);
++	dbname = get_database_name(MyDatabaseId);
++	tablename = psprintf("%s.%s",
++						 get_namespace_name(RelationGetNamespace(rel)),
++						 RelationGetRelationName(rel));
++
++	for (int i = 0; i < tupdesc->natts; i++)
++	{
++		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
++		char	   *comment;
++		char	   *desc;
++		char	   *asset;
++		StringInfoData buf;
++
++		if (att->attisdropped)
++			continue;
++
++		comment = GetComment(relid, RelationRelationId, att->attnum);
++		if (comment == NULL || !_PGS_Discreet_Metadata_ParseComment(comment, &desc))
++			continue;
++
++		/* No desc in the comment: identify the column by name */
++		if (desc == NULL)
++			desc = psprintf("%s.%s", tablename, NameStr(att->attname));
++
++		asset = _PGS_Discreet_Metadata_AssetName(MyDatabaseId, relid, att->attnum);
++
++		/* tableId and databaseId stay together: the file is filtered on them */
++		initStringInfo(&buf);
++		appendStringInfoString(&buf, "{\"assetName\": ");
++		escape_json(&buf, asset);
++		appendStringInfoString(&buf, ", \"assetDescription\": ");
++		escape_json(&buf, desc);
++		appendStringInfo(&buf, ", \"columnId\": %d, \"tableId\": %u, \"databaseId\": %u",
++						 att->attnum, relid, MyDatabaseId);
++		appendStringInfoString(&buf, ", \"columnName\": ");
++		escape_json(&buf, NameStr(att->attname));
++		appendStringInfoString(&buf, ", \"tableName\": ");
++		escape_json(&buf, tablename);
++		appendStringInfoString(&buf, ", \"databaseName\": ");
++		escape_json(&buf, dbname ? dbname : "");
++		appendStringInfoChar(&buf, '}');
++
++		*records = lappend(*records, buf.data);
++
++		elog(LOG, "[DISCREET_METADATA] asset %s | %s.%s (column %d, table %u, database %u) | %s",
++			 asset, tablename, NameStr(att->attname), att->attnum, relid,
++			 MyDatabaseId, desc);
++	}
++
++	RelationClose(rel);
++}
++
++/*
++ * Rewrite metadata.json: keep the records of tables not touched in this
++ * transaction, replace the records of the touched ones.
++ */
++static void
++_PGS_Discreet_Metadata_Write(void)
++{
++	List	   *records = NIL;
++	List	   *kept = NIL;
++	List	   *keys = NIL;
++	LOCKTAG		tag;
++	FILE	   *fp;
++	StringInfoData out;
++	ListCell   *lc;
++	bool		first = true;
++	int			nkept;
++	int			nremoved = 0;
++
++	foreach(lc, pending_relids)
++	{
++		Oid			relid = lfirst_oid(lc);
++
++		keys = lappend(keys, psprintf("\"tableId\": %u, \"databaseId\": %u,",
++									  relid, MyDatabaseId));
++		_PGS_Discreet_Metadata_CollectTable(relid, &records);
++	}
++
++	/*
++	 * One writer at a time, across all databases (database field 0): an
++	 * advisory lock held until this transaction ends.
++	 */
++	SET_LOCKTAG_ADVISORY(tag, InvalidOid, 0x44495343, 0x4D455441, 2);
++	(void) LockAcquire(&tag, ExclusiveLock, false, false);
++
++	/* Records are one per line, between "[" and "]" */
++	fp = AllocateFile(DISCREET_METADATA_FILE, "r");
++	if (fp != NULL)
++	{
++		StringInfoData line;
++
++		initStringInfo(&line);
++		while (pg_get_line_buf(fp, &line))
++		{
++			char	   *rec = _PGS_Discreet_Metadata_Trim(line.data);
++			size_t		len = strlen(rec);
++			bool		replaced = false;
++			ListCell   *lk;
++
++			if (rec[0] != '{')
++				continue;
++			if (rec[len - 1] == ',')
++				rec[len - 1] = '\0';
++
++			foreach(lk, keys)
++			{
++				if (strstr(rec, (char *) lfirst(lk)) != NULL)
++				{
++					replaced = true;
++					break;
++				}
++			}
++			if (replaced)
++				nremoved++;
++			else
++				kept = lappend(kept, pstrdup(rec));
++		}
++		FreeFile(fp);
++	}
++	else if (errno != ENOENT)
++	{
++		ereport(WARNING,
++				(errcode_for_file_access(),
++				 errmsg("[DISCREET_METADATA] could not read \"%s\": %m",
++						DISCREET_METADATA_FILE)));
++		return;
++	}
++
++	/* Counted before list_concat() appends the new records to kept */
++	nkept = list_length(kept);
++
++	initStringInfo(&out);
++	appendStringInfoString(&out, "[\n");
++	foreach(lc, list_concat(kept, records))
++	{
++		appendStringInfo(&out, "%s  %s", first ? "" : ",\n", (char *) lfirst(lc));
++		first = false;
++	}
++	appendStringInfoString(&out, first ? "]\n" : "\n]\n");
++
++	/* Write a temporary file and rename it, so readers never see half a file */
++	fp = AllocateFile(DISCREET_METADATA_TMPFILE, PG_BINARY_W);
++	if (fp == NULL ||
++		fwrite(out.data, 1, out.len, fp) != (size_t) out.len)
++	{
++		ereport(WARNING,
++				(errcode_for_file_access(),
++				 errmsg("[DISCREET_METADATA] could not write \"%s\": %m",
++						DISCREET_METADATA_TMPFILE)));
++		if (fp != NULL)
++			FreeFile(fp);
++		return;
++	}
++	if (FreeFile(fp) != 0)
++	{
++		ereport(WARNING,
++				(errcode_for_file_access(),
++				 errmsg("[DISCREET_METADATA] could not close \"%s\": %m",
++						DISCREET_METADATA_TMPFILE)));
++		return;
++	}
++	if (durable_rename(DISCREET_METADATA_TMPFILE, DISCREET_METADATA_FILE, WARNING) != 0)
++		return;
++
++	elog(LOG, "[DISCREET_METADATA] wrote %s | %d record(s) for %d table(s) of database %u, %d old record(s) removed, %d other record(s) kept",
++		 DISCREET_METADATA_FILE, list_length(records), list_length(pending_relids),
++		 MyDatabaseId, nremoved, nkept);
++}
++
++/* Write at commit; forget the tables when the transaction ends */
++static void
++_PGS_Discreet_Metadata_XactCallback(XactEvent event, void *arg)
++{
++	switch (event)
++	{
++		case XACT_EVENT_PRE_COMMIT:
++			if (pending_relids != NIL)
++				_PGS_Discreet_Metadata_Write();
++			break;
++		case XACT_EVENT_COMMIT:
++		case XACT_EVENT_ABORT:
++		case XACT_EVENT_PREPARE:
++		case XACT_EVENT_PARALLEL_COMMIT:
++		case XACT_EVENT_PARALLEL_ABORT:
++			/* The list itself goes with TopTransactionContext */
++			pending_relids = NIL;
++			break;
++		default:
++			break;
++	}
++}
+diff --git a/src/backend/executor/am_client.cpp b/src/backend/executor/am_client.cpp
+new file mode 100644
+index 00000000000..5ec7b920941
+--- /dev/null
++++ b/src/backend/executor/am_client.cpp
+@@ -0,0 +1,549 @@
++/*-------------------------------------------------------------------------
++ *
++ * am_client.cpp
++ *	  Client of the Asset Access Service (AM), used by runtime_security.c.
++ *	  Everything that leaves PostgreSQL goes through here.
++ *
++ * Settings: am_client.conf in the data directory, read on every call, one
++ * "name = value" per line, # starts a comment:
++ *
++ *	url = http://127.0.0.1:8090           AM's address; empty = do not send
++ *	api_key = ak_...                      default X-Api-Key
++ *	api_key.<TenantID> = ak_...           X-Api-Key of one tenant
++ *	timeout_ms = 5000
++ *	path.tenants = /api/v1/tenants        POST a tenant
++ *	path.users = /api/v1/users            POST a user
++ *	path.roles = /api/v1/roles            POST the role-asset matrix
++ *	path.user_assets = /api/v1/users/{username}/assets   GET at login
++ *
++ * The real AM (asset-access-service.jar) takes the matrix and new tenants
++ * only from its platform admin, through its admin API.  Setting admin_user
++ * switches "roles" and "tenants" to that API: each call signs in for a
++ * token, sends it as "Authorization: Bearer", and signs out.  Users and
++ * logins keep using the tenant's API key.
++ *
++ *	admin_user = admin                    AM's platform admin
++ *	admin_password = ...
++ *	tenant_admin_user = manager           first admin of each new tenant
++ *	tenant_admin_password = ...           (AM refuses a tenant without one)
++ *	path.admin_token = /api/admin/auth/token
++ *	path.admin_logout = /api/admin/auth/logout
++ *	path.roles and path.tenants then default to /api/admin/role-asset-map
++ *	and /api/admin/tenants.
++ *	user_password = random                AM requires a password for every
++ *	                                      user; this sends a random one that
++ *	                                      nobody knows.  The flow never signs
++ *	                                      users in to AM: logins fetch their
++ *	                                      assets with the tenant's API key.
++ *
++ * Every call is appended to am_outbox.jsonl in the data directory, one JSON
++ * object per line: time, method, path, tenantId, status and the request
++ * body.  The API key, the admin and tenant admin passwords, the admin token
++ * and AM's answers (which carry the asset values) are never written.
++ *
++ * Only plain C crosses into PostgreSQL: no exception leaves this file and
++ * nothing here calls elog.  HTTP uses WinHTTP (part of Windows).
++ *
++ * src/backend/executor/am_client.cpp
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "executor/am_client.h"
++
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <fstream>
++#include <map>
++#include <random>
++#include <string>
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <winhttp.h>
++#pragma comment(lib, "winhttp.lib")
++#endif
++
++namespace
++{
++
++const char *CONFIG_FILE = "am_client.conf";
++const char *OUTBOX_FILE = "am_outbox.jsonl";
++const size_t MAX_RESPONSE = 1024 * 1024;
++
++typedef std::map<std::string, std::string> Config;
++
++std::string
++_PGS_trim(const std::string &s)
++{
++	size_t		b = s.find_first_not_of(" \t\r\n");
++	size_t		e = s.find_last_not_of(" \t\r\n");
++
++	return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
++}
++
++Config
++_PGS_read_config()
++{
++	Config		cfg;
++	std::ifstream in(CONFIG_FILE);
++	std::string line;
++
++	while (std::getline(in, line))
++	{
++		size_t		hash = line.find('#');
++		size_t		eq;
++
++		if (hash != std::string::npos)
++			line.erase(hash);
++		eq = line.find('=');
++		if (eq != std::string::npos)
++			cfg[_PGS_trim(line.substr(0, eq))] = _PGS_trim(line.substr(eq + 1));
++	}
++	return cfg;
++}
++
++std::string
++_PGS_setting(const Config &cfg, const std::string &name, const std::string &dflt)
++{
++	Config::const_iterator it = cfg.find(name);
++
++	return it == cfg.end() || it->second.empty() ? dflt : it->second;
++}
++
++/* Percent-encode a path segment ("Asset 1" -> "Asset%201") */
++std::string
++_PGS_url_encode(const std::string &s)
++{
++	static const char hex[] = "0123456789ABCDEF";
++	std::string out;
++
++	for (unsigned char c : s)
++	{
++		if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
++			out += (char) c;
++		else
++		{
++			out += '%';
++			out += hex[c >> 4];
++			out += hex[c & 15];
++		}
++	}
++	return out;
++}
++
++std::string
++_PGS_json_string(const std::string &s)
++{
++	std::string out = "\"";
++
++	for (unsigned char c : s)
++	{
++		if (c == '"' || c == '\\')
++		{
++			out += '\\';
++			out += (char) c;
++		}
++		else if (c < 0x20)
++		{
++			char		buf[8];
++
++			snprintf(buf, sizeof(buf), "\\u%04x", c);
++			out += buf;
++		}
++		else
++			out += (char) c;
++	}
++	return out + "\"";
++}
++
++void
++_PGS_write_outbox(const std::string &method, const std::string &path,
++			 long long tenant_id, int status, const char *body)
++{
++	std::ofstream out(OUTBOX_FILE, std::ios::app | std::ios::binary);
++	char		when[32];
++	time_t		now = time(nullptr);
++	struct tm	tmv;
++
++#ifdef _WIN32
++	gmtime_s(&tmv, &now);
++#else
++	gmtime_r(&now, &tmv);
++#endif
++	strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", &tmv);
++
++	/* body is JSON built by PostgreSQL, so it is written as it is */
++	out << "{\"time\": \"" << when << "\", \"method\": \"" << method
++		<< "\", \"path\": " << _PGS_json_string(path)
++		<< ", \"tenantId\": " << tenant_id
++		<< ", \"status\": " << status
++		<< ", \"body\": " << (body ? body : "null") << "}\n";
++}
++
++#ifdef _WIN32
++std::wstring
++_PGS_widen(const std::string &s)
++{
++	int			n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
++	std::wstring w(n > 0 ? n : 1, L'\0');
++
++	if (n > 0)
++		MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
++	w.resize(wcslen(w.c_str()));
++	return w;
++}
++
++struct Handle
++{
++	HINTERNET	h;
++	explicit Handle(HINTERNET x) : h(x) {}
++	~Handle() { if (h) WinHttpCloseHandle(h); }
++};
++
++/* The WinHTTP error, read before any handle is closed */
++int
++_PGS_winhttp_error(const std::string &method, const std::string &url, std::string &error)
++{
++	char		buf[64];
++
++	snprintf(buf, sizeof(buf), "WinHTTP error %lu", (unsigned long) GetLastError());
++	error = std::string(buf) + " calling " + method + " " + url;
++	return -1;
++}
++
++/* auth is one header line without its CRLF ("X-Api-Key: ..."), or empty */
++int
++_PGS_http(const std::string &method, const std::string &url,
++	 const std::string &auth, const char *body, int timeout_ms,
++	 std::string &response, std::string &error)
++{
++	std::wstring wurl = _PGS_widen(url);
++	URL_COMPONENTS uc;
++	wchar_t		host[256];
++	wchar_t		path[4096];
++	DWORD		status = 0;
++	DWORD		size = sizeof(status);
++	std::wstring headers = L"Accept: application/json\r\n";
++	DWORD		body_len = body ? (DWORD) strlen(body) : 0;
++
++	memset(&uc, 0, sizeof(uc));
++	uc.dwStructSize = sizeof(uc);
++	uc.lpszHostName = host;
++	uc.dwHostNameLength = 256;
++	uc.lpszUrlPath = path;
++	uc.dwUrlPathLength = 4096;
++	if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc))
++	{
++		error = "bad url in am_client.conf: " + url;
++		return -1;
++	}
++
++	Handle		session(WinHttpOpen(L"PostgreSQL-RuntimeSecurity/1.0",
++									WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
++									WINHTTP_NO_PROXY_NAME,
++									WINHTTP_NO_PROXY_BYPASS, 0));
++	if (!session.h)
++		return _PGS_winhttp_error(method, url, error);
++	WinHttpSetTimeouts(session.h, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
++
++	Handle		connect(WinHttpConnect(session.h, host, uc.nPort, 0));
++	if (!connect.h)
++		return _PGS_winhttp_error(method, url, error);
++
++	Handle		request(WinHttpOpenRequest(connect.h, _PGS_widen(method).c_str(), path,
++										   nullptr, WINHTTP_NO_REFERER,
++										   WINHTTP_DEFAULT_ACCEPT_TYPES,
++										   uc.nScheme == INTERNET_SCHEME_HTTPS ?
++										   WINHTTP_FLAG_SECURE : 0));
++	if (!request.h)
++		return _PGS_winhttp_error(method, url, error);
++
++	if (!auth.empty())
++		headers += _PGS_widen(auth) + L"\r\n";
++	if (body)
++		headers += L"Content-Type: application/json\r\n";
++
++	if (!WinHttpSendRequest(request.h, headers.c_str(), (DWORD) -1L,
++							body ? (LPVOID) body : WINHTTP_NO_REQUEST_DATA,
++							body_len, body_len, 0) ||
++		!WinHttpReceiveResponse(request.h, nullptr) ||
++		!WinHttpQueryHeaders(request.h,
++							 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
++							 WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
++							 WINHTTP_NO_HEADER_INDEX))
++		return _PGS_winhttp_error(method, url, error);
++
++	for (;;)
++	{
++		DWORD		avail = 0;
++		DWORD		got = 0;
++		char		buf[8192];
++
++		if (!WinHttpQueryDataAvailable(request.h, &avail))
++			return _PGS_winhttp_error(method, url, error);
++		if (avail == 0)
++			break;
++		if (avail > sizeof(buf))
++			avail = sizeof(buf);
++		if (!WinHttpReadData(request.h, buf, avail, &got))
++			return _PGS_winhttp_error(method, url, error);
++		if (got == 0)
++			break;
++		if (response.size() + got > MAX_RESPONSE)
++		{
++			error = "AM's answer is too large";
++			return -1;
++		}
++		response.append(buf, got);
++	}
++	return (int) status;
++}
++#else
++int
++_PGS_http(const std::string &, const std::string &, const std::string &,
++	 const char *, int, std::string &, std::string &error)
++{
++	error = "the AM client is only built for Windows (WinHTTP)";
++	return -1;
++}
++#endif
++
++/*
++ * The text of a string field in a JSON answer ("accessToken": "..."), or
++ * empty.  AM's answers are small and well formed; this is not a general
++ * JSON parser.
++ */
++std::string
++_PGS_json_text(const std::string &json, const std::string &field)
++{
++	size_t		at = json.find("\"" + field + "\"");
++	std::string out;
++
++	if (at == std::string::npos)
++		return out;
++	at = json.find(':', at + field.size() + 2);
++	if (at == std::string::npos)
++		return out;
++	at = json.find_first_not_of(" \t\r\n", at + 1);
++	if (at == std::string::npos || json[at] != '"')
++		return out;
++	for (size_t i = at + 1; i < json.size(); i++)
++	{
++		if (json[i] == '"')
++			return out;
++		if (json[i] == '\\')
++			return std::string();	/* escapes never occur in a token */
++		out += json[i];
++	}
++	return std::string();
++}
++
++/*
++ * One call to AM's admin API: sign in as the platform admin, make the call
++ * with the token, sign out.  Returns the call's HTTP status, or the sign-in's
++ * if that failed (answer then holds AM's reason), or -1.
++ */
++int
++_PGS_admin_http(const Config &cfg, const std::string &url,
++				const std::string &method, const std::string &path,
++				const char *body, int timeout_ms,
++				std::string &answer, std::string &error)
++{
++	std::string login = "{\"username\": " + _PGS_json_string(_PGS_setting(cfg, "admin_user", "")) +
++		", \"password\": " + _PGS_json_string(_PGS_setting(cfg, "admin_password", "")) + "}";
++	std::string token;
++	std::string ignored;
++	std::string ignored_error;
++	int			status;
++
++	status = _PGS_http("POST", url + _PGS_setting(cfg, "path.admin_token", "/api/admin/auth/token"),
++					   "", login.c_str(), timeout_ms, answer, error);
++	if (status != 200)
++		return status;
++	token = _PGS_json_text(answer, "accessToken");
++	answer.clear();
++	if (token.empty())
++	{
++		error = "AM's sign-in answer has no accessToken";
++		return -1;
++	}
++
++	status = _PGS_http(method, url + path, "Authorization: Bearer " + token,
++					   body, timeout_ms, answer, error);
++
++	/* the token would expire on its own; ending it now is tidier */
++	_PGS_http("POST", url + _PGS_setting(cfg, "path.admin_logout", "/api/admin/auth/logout"),
++			  "Authorization: Bearer " + token, nullptr, timeout_ms, ignored, ignored_error);
++	return status;
++}
++
++/* body (a JSON object) with one more field: "name": value (value is JSON) */
++std::string
++_PGS_with_field(const char *body, const std::string &name, const std::string &value)
++{
++	std::string out = body ? body : "{}";
++	size_t		end = out.find_last_of('}');
++
++	if (end == std::string::npos)
++		return out;
++	return out.substr(0, end) + ", " + _PGS_json_string(name) + ": " + value + "}";
++}
++
++/*
++ * A new tenant for AM's admin API: PostgreSQL's {"slug", "name"} plus the
++ * tenant's first admin from am_client.conf, which AM requires.
++ */
++std::string
++_PGS_with_tenant_admin(const Config &cfg, const char *body)
++{
++	return _PGS_with_field(body, "admin",
++						   "{\"username\": " + _PGS_json_string(_PGS_setting(cfg, "tenant_admin_user", "")) +
++						   ", \"password\": " + _PGS_json_string(_PGS_setting(cfg, "tenant_admin_password", "")) + "}");
++}
++
++/*
++ * 32 random letters and digits.  std::random_device is the operating
++ * system's secure generator on Windows (rand_s).
++ */
++std::string
++_PGS_random_password()
++{
++	static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
++	std::random_device rd;
++	std::string out;
++
++	while (out.size() < 32)
++	{
++		unsigned int r = rd() & 63;
++
++		if (r < 62)				/* no modulo bias */
++			out += chars[r];
++	}
++	return out;
++}
++
++}								/* namespace */
++
++extern "C" int
++_PGS_AmClient_Call(const char *endpoint, const char *username, long long tenant_id,
++			  const char *body, char **response, char *errbuf, int errbuflen)
++{
++	if (response)
++		*response = nullptr;
++	if (errbuf && errbuflen > 0)
++		errbuf[0] = '\0';
++
++	try
++	{
++		Config		cfg = _PGS_read_config();
++		std::string ep = endpoint ? endpoint : "";
++		std::string method = ep == "user_assets" ? "GET" : "POST";
++		std::string path;
++		std::string url = _PGS_setting(cfg, "url", "");
++		std::string api_key;
++		std::string answer;
++		std::string error;
++		int			timeout_ms = atoi(_PGS_setting(cfg, "timeout_ms", "5000").c_str());
++		int			status;
++
++		/* the matrix and new tenants go to AM's admin API when one is set */
++		bool		admin = (ep == "tenants" || ep == "roles") &&
++			!_PGS_setting(cfg, "admin_user", "").empty();
++
++		if (ep == "tenants")
++			path = _PGS_setting(cfg, "path.tenants",
++								admin ? "/api/admin/tenants" : "/api/v1/tenants");
++		else if (ep == "users")
++			path = _PGS_setting(cfg, "path.users", "/api/v1/users");
++		else if (ep == "roles")
++			path = _PGS_setting(cfg, "path.roles",
++								admin ? "/api/admin/role-asset-map" : "/api/v1/roles");
++		else if (ep == "user_assets")
++		{
++			size_t		at;
++
++			std::string user = username ? username : "";
++
++			/*
++			 * url_encode leaves dots alone and URL parsing collapses "." and
++			 * "..", so a user named ".." would turn /users/../assets into
++			 * /assets: another endpoint.
++			 */
++			if (user.empty() || user == "." || user == "..")
++			{
++				snprintf(errbuf, errbuflen, "\"%s\" is not a valid username for AM", user.c_str());
++				return -1;
++			}
++			path = _PGS_setting(cfg, "path.user_assets", "/api/v1/users/{username}/assets");
++			at = path.find("{username}");
++			if (at != std::string::npos)
++				path.replace(at, 10, _PGS_url_encode(user));
++			body = nullptr;
++		}
++		else
++		{
++			snprintf(errbuf, errbuflen, "unknown AM endpoint \"%s\"", ep.c_str());
++			return -1;
++		}
++
++		if (url.empty())
++		{
++			_PGS_write_outbox(method, path, tenant_id, 0, body);
++			return 0;
++		}
++		while (!url.empty() && url.back() == '/')
++			url.pop_back();
++
++		if (admin)
++		{
++			std::string sent = ep == "tenants" ? _PGS_with_tenant_admin(cfg, body) : body ? body : "";
++
++			status = _PGS_admin_http(cfg, url, method, path, sent.c_str(), timeout_ms,
++									 answer, error);
++		}
++		else
++		{
++			std::string sent = body ? body : "";
++
++			if (ep == "users" && _PGS_setting(cfg, "user_password", "") == "random")
++				sent = _PGS_with_field(body, "password", _PGS_json_string(_PGS_random_password()));
++			api_key = _PGS_setting(cfg, "api_key." + std::to_string(tenant_id),
++							  _PGS_setting(cfg, "api_key", ""));
++			status = _PGS_http(method, url + path,
++						  api_key.empty() ? "" : "X-Api-Key: " + api_key,
++						  body ? sent.c_str() : nullptr,
++						  timeout_ms, answer, error);
++		}
++		/* PostgreSQL's body only: never a password */
++		_PGS_write_outbox(method, path, tenant_id, status, body);
++
++		if (status < 0)
++		{
++			snprintf(errbuf, errbuflen, "%s", error.c_str());
++			return -1;
++		}
++		if (response)
++		{
++			*response = (char *) malloc(answer.size() + 1);
++			if (*response)
++				memcpy(*response, answer.c_str(), answer.size() + 1);
++		}
++		return status;
++	}
++	catch (...)
++	{
++		if (errbuf && errbuflen > 0)
++			snprintf(errbuf, errbuflen, "internal error in the AM client");
++		return -1;
++	}
++}
++
++extern "C" void
++_PGS_AmClient_Free(char *response)
++{
++	free(response);
++}
+diff --git a/src/backend/executor/cpp_logger.cpp b/src/backend/executor/cpp_logger.cpp
+new file mode 100644
+index 00000000000..689cac571b7
+--- /dev/null
++++ b/src/backend/executor/cpp_logger.cpp
+@@ -0,0 +1,8 @@
++#include <iostream>
++
++// Use extern "C" so C files can call this function
++extern "C" {
++    void _PGS_myCppFunction(int value) {
++        std::cout << "Hello from C++ inside Postgres Executor! Value: " << value << std::endl;
++    }
++}
+\ No newline at end of file
+diff --git a/src/backend/executor/discreet_hooks.c b/src/backend/executor/discreet_hooks.c
+new file mode 100644
+index 00000000000..e94304c8b99
+--- /dev/null
++++ b/src/backend/executor/discreet_hooks.c
+@@ -0,0 +1,1574 @@
++/*-------------------------------------------------------------------------
++ *
++ * discreet_hooks.c
++ *	  Discreet R1/W1 executor instrumentation hooks.
++ *
++ * Everything the executor calls for the Discreet test suite (TC-01..TC-12):
++ *
++ *	_PGS_LogExecutorTableInfo / _PGS_Discreet_LogExecutorRun
++ *		the logger hook (standard_ExecutorRun, ExecInsert/Update/Delete)
++ *	_PGS_Discreet_R1_Intercept
++ *		R1, called from ExecutePlan() for each result row before delivery
++ *	_PGS_Discreet_W1_Insert / _PGS_Discreet_W1_Update / _PGS_Discreet_W1_Delete
++ *		W1, called from nodeModifyTable.c before each row is written
++ *
++ * Kept out of execMain.c and nodeModifyTable.c so those files carry only the
++ * hook calls.  Synthetic test data only: these log column values.
++ *
++ * src/backend/executor/discreet_hooks.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include "access/sysattr.h"
++#include "access/tableam.h"
++#include "access/transam.h"
++#include "catalog/pg_class.h"
++#include "catalog/pg_type.h"
++#include "common/int.h"
++#include "executor/discreet_hooks.h"
++#include "catalog/namespace.h"
++#include "executor/executor.h"
++#include "executor/spi.h"
++#include "lib/stringinfo.h"
++#include "miscadmin.h"
++#include "nodes/makefuncs.h"
++#include "nodes/nodeFuncs.h"
++#include "nodes/plannodes.h"
++#include "optimizer/optimizer.h"
++#include "parser/parsetree.h"
++#include "utils/array.h"
++#include "utils/builtins.h"
++#include "utils/datum.h"
++#include "utils/guc.h"
++#include "utils/guc_tables.h"
++#include "utils/lsyscache.h"
++#include "utils/rel.h"
++#include "utils/snapmgr.h"
++
++
++/* ----------------------------------------------------------------
++ *		Logger hook and R1 (read side)
++ * ----------------------------------------------------------------
++ */
++
++/*
++ * Custom hook function to log table ID, PID, and thread ID
++ */
++void
++_PGS_LogExecutorTableInfo(const char *action, Oid table_oid, const char *relname)
++{
++#ifdef WIN32
++	unsigned long threadId = (unsigned long) GetCurrentThreadId();
++#else
++	unsigned long threadId = (unsigned long) MyProcPid;
++#endif
++
++	if (relname != NULL && OidIsValid(table_oid))
++	{
++		elog(LOG, "[CUSTOM_HOOK] Action: %s | Table: %s (OID: %u) | PID: %d | Thread ID: %lu",
++			 action, relname, (unsigned int) table_oid, (int) MyProcPid, threadId);
++	}
++	else if (OidIsValid(table_oid))
++	{
++		elog(LOG, "[CUSTOM_HOOK] Action: %s | Table OID: %u | PID: %d | Thread ID: %lu",
++			 action, (unsigned int) table_oid, (int) MyProcPid, threadId);
++	}
++	else
++	{
++		elog(LOG, "[CUSTOM_HOOK] Action: %s | Table: (Virtual/None) | PID: %d | Thread ID: %lu",
++			 action, (int) MyProcPid, threadId);
++	}
++}
++
++/*
++ * Logger hook for ExecutorRun: one line per table the plan uses, or one
++ * "(Virtual/None)" line when it uses none.
++ */
++void
++_PGS_Discreet_LogExecutorRun(QueryDesc *queryDesc)
++{
++	if (queryDesc->plannedstmt != NULL && queryDesc->plannedstmt->relationOids != NIL)
++	{
++		ListCell   *lc;
++
++		foreach(lc, queryDesc->plannedstmt->relationOids)
++		{
++			Oid			relOid = lfirst_oid(lc);
++			char	   *rname = get_rel_name(relOid);
++
++			_PGS_LogExecutorTableInfo("ExecutorRun", relOid, rname);
++		}
++	}
++	else
++	{
++		_PGS_LogExecutorTableInfo("ExecutorRun", InvalidOid, NULL);
++	}
++}
++
++/*
++ * DISCREET R1 helpers.
++ *
++ * The test suite (TC-01..TC-12) needs more than the final values: which scan
++ * produced them (TC-01..04), which base table and column each output column
++ * came from (TC-09 JOIN, TC-10 expressions), and whether the application
++ * identity came from a trusted place (TC-12).
++ */
++
++/* Human-readable name of a scan node, or NULL for non-scan nodes. */
++static const char *
++_PGS_Discreet_ScanName(Plan *plan)
++{
++	switch (nodeTag(plan))
++	{
++		case T_SeqScan:
++			return "Seq Scan";
++		case T_IndexScan:
++			return "Index Scan";
++		case T_IndexOnlyScan:
++			return "Index Only Scan";
++		case T_BitmapHeapScan:
++			return "Bitmap Heap Scan";
++		case T_TidScan:
++			return "Tid Scan";
++		case T_TidRangeScan:
++			return "Tid Range Scan";
++		case T_SampleScan:
++			return "Sample Scan";
++		case T_FunctionScan:
++			return "Function Scan";
++		case T_ValuesScan:
++			return "Values Scan";
++		case T_SubqueryScan:
++			return "Subquery Scan";
++		case T_CteScan:
++			return "CTE Scan";
++		default:
++			return NULL;
++	}
++}
++
++/* Walk the plan tree and list every scan with the relation it reads. */
++static void
++_PGS_Discreet_CollectScans(Plan *plan, List *rtable, StringInfo out)
++{
++	const char *scan;
++
++	if (plan == NULL)
++		return;
++
++	scan = _PGS_Discreet_ScanName(plan);
++	if (scan != NULL)
++	{
++		Index		scanrelid = ((Scan *) plan)->scanrelid;
++		const char *relname = NULL;
++
++		if (scanrelid > 0 && scanrelid <= list_length(rtable))
++		{
++			RangeTblEntry *rte = rt_fetch(scanrelid, rtable);
++
++			if (rte->rtekind == RTE_RELATION)
++				relname = get_rel_name(rte->relid);
++		}
++		if (out->len > 0)
++			appendStringInfoString(out, ", ");
++		appendStringInfo(out, "%s on %s", scan, relname ? relname : "(non-relation)");
++	}
++
++	_PGS_Discreet_CollectScans(plan->lefttree, rtable, out);
++	_PGS_Discreet_CollectScans(plan->righttree, rtable, out);
++
++	/* Append / MergeAppend children (partitions, UNION ALL) */
++	if (IsA(plan, Append))
++	{
++		ListCell   *lc;
++
++		foreach(lc, ((Append *) plan)->appendplans)
++			_PGS_Discreet_CollectScans((Plan *) lfirst(lc), rtable, out);
++	}
++	else if (IsA(plan, MergeAppend))
++	{
++		ListCell   *lc;
++
++		foreach(lc, ((MergeAppend *) plan)->mergeplans)
++			_PGS_Discreet_CollectScans((Plan *) lfirst(lc), rtable, out);
++	}
++}
++
++/* "employee.salary attnum 4" for a range-table index and column number. */
++static void
++_PGS_Discreet_AppendColumnRef(StringInfo out, List *rtable, Index rtindex, AttrNumber attno)
++{
++	if (rtindex > 0 && rtindex <= list_length(rtable))
++	{
++		RangeTblEntry *rte = rt_fetch(rtindex, rtable);
++
++		if (rte->rtekind == RTE_RELATION && attno > 0)
++		{
++			char	   *relname = get_rel_name(rte->relid);
++			char	   *attname = get_attname(rte->relid, attno, true);
++
++			appendStringInfo(out, "%s.%s attnum %d",
++							 relname ? relname : "?", attname ? attname : "?", (int) attno);
++			return;
++		}
++	}
++	appendStringInfoString(out, "(not a base column)");
++}
++
++/*
++ * Where output column `resno` came from.
++ *
++ * A plain column carries its base table and column on the target entry
++ * (resorigtbl/resorigcol, the same thing the client RowDescription reports).
++ * For a computed column, the base columns it reads are found through the
++ * syntactic Var referents (varnosyn/varattnosyn), which keep pointing at the
++ * range table even after joins renumber Vars to OUTER/INNER.
++ */
++static void
++_PGS_Discreet_AppendSource(StringInfo out, PlannedStmt *stmt, AttrNumber resno)
++{
++	ListCell   *lc;
++	TargetEntry *tle = NULL;
++
++	if (stmt == NULL || stmt->planTree == NULL)
++		return;
++
++	foreach(lc, stmt->planTree->targetlist)
++	{
++		TargetEntry *candidate = (TargetEntry *) lfirst(lc);
++
++		if (candidate->resno == resno)
++		{
++			tle = candidate;
++			break;
++		}
++	}
++	if (tle == NULL)
++		return;
++
++	if (OidIsValid(tle->resorigtbl) && tle->resorigcol > 0)
++	{
++		char	   *relname = get_rel_name(tle->resorigtbl);
++		char	   *attname = get_attname(tle->resorigtbl, tle->resorigcol, true);
++
++		appendStringInfo(out, " source: %s.%s attnum %d",
++						 relname ? relname : "?", attname ? attname : "?",
++						 (int) tle->resorigcol);
++	}
++	else
++	{
++		List	   *vars = pull_var_clause((Node *) tle->expr,
++										   PVC_RECURSE_AGGREGATES |
++										   PVC_RECURSE_WINDOWFUNCS |
++										   PVC_RECURSE_PLACEHOLDERS);
++		ListCell   *vc;
++		bool		first = true;
++
++		appendStringInfoString(out, " source: computed");
++		foreach(vc, vars)
++		{
++			Var		   *var = (Var *) lfirst(vc);
++
++			appendStringInfoString(out, first ? " from " : ", ");
++			_PGS_Discreet_AppendColumnRef(out, stmt->rtable, var->varnosyn, var->varattnosyn);
++			first = false;
++		}
++		list_free(vars);
++	}
++}
++
++/*
++ * The application identity is only trusted when an administrator set it:
++ * ALTER ROLE / ALTER DATABASE ... SET discreet.app_user, or postgresql.conf.
++ * A SET in the session, or startup options the client sends (PGOPTIONS), are
++ * client-asserted and never validated (TC-12: "never a client-asserted
++ * value").
++ */
++static bool
++_PGS_Discreet_IdentityTrusted(const char *name)
++{
++	struct config_generic *record = find_option(name, false, true, DEBUG5);
++
++	if (record == NULL)
++		return false;
++	switch (record->source)
++	{
++		case PGC_S_FILE:
++		case PGC_S_DATABASE:
++		case PGC_S_USER:
++		case PGC_S_DATABASE_USER:
++			return true;
++		default:
++			return false;
++	}
++}
++
++/*
++ * DISCREET R1: Intercept result tuples in ExecutePlan right before sendTuples
++ */
++void
++_PGS_Discreet_R1_Intercept(QueryDesc *queryDesc, TupleTableSlot *slot, uint64 row_num)
++{
++	TupleDesc	tupdesc = slot->tts_tupleDescriptor;
++	PlannedStmt *stmt = queryDesc != NULL ? queryDesc->plannedstmt : NULL;
++	StringInfoData buf;
++	StringInfoData tables_buf;
++	int			i;
++	const char *app_user;
++	const char *tenant;
++	const char *req_id;
++
++	initStringInfo(&buf);
++	initStringInfo(&tables_buf);
++
++	/* Determine target relation(s) from query plan if available */
++	if (stmt != NULL && stmt->relationOids != NIL)
++	{
++		ListCell   *lc;
++		bool		first = true;
++
++		foreach(lc, stmt->relationOids)
++		{
++			Oid			relOid = lfirst_oid(lc);
++			char	   *rname = get_rel_name(relOid);
++
++			if (!first)
++				appendStringInfoString(&tables_buf, ", ");
++			appendStringInfo(&tables_buf, "%s (OID: %u)", rname ? rname : "unknown", (unsigned int) relOid);
++			first = false;
++		}
++	}
++	else
++	{
++		appendStringInfoString(&tables_buf, "(Virtual/Expression)");
++	}
++
++	/* Once per query: the scan path that produced the rows (TC-01..TC-04) */
++	if (row_num == 1 && stmt != NULL && stmt->planTree != NULL)
++	{
++		StringInfoData scans;
++
++		initStringInfo(&scans);
++		_PGS_Discreet_CollectScans(stmt->planTree, stmt->rtable, &scans);
++		elog(LOG, "[DISCREET_R1] PLAN | Table: %s | Scans: %s",
++			 tables_buf.data, scans.len > 0 ? scans.data : "(none)");
++		pfree(scans.data);
++	}
++
++	slot_getallattrs(slot);
++
++	appendStringInfo(&buf, "[DISCREET_R1] READ row %llu | Table: %s",
++					 (unsigned long long) row_num, tables_buf.data);
++
++	for (i = 0; i < tupdesc->natts; i++)
++	{
++		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++		bool		isnull = slot->tts_isnull[i];
++
++		if (isnull)
++		{
++			appendStringInfo(&buf, " | attnum %d (%s): NULL isnull: true",
++							 i + 1, NameStr(attr->attname));
++		}
++		else
++		{
++			Oid			typoutput;
++			bool		typisvarlena;
++			char	   *val_str;
++
++			getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
++			val_str = OidOutputFunctionCall(typoutput, slot->tts_values[i]);
++			appendStringInfo(&buf, " | attnum %d (%s): %s isnull: false",
++							 i + 1, NameStr(attr->attname), val_str ? val_str : "");
++		}
++		/* Base table and column behind this output column (TC-09, TC-10) */
++		_PGS_Discreet_AppendSource(&buf, stmt, (AttrNumber) (i + 1));
++	}
++
++	/* Application identity (TC-12) */
++	app_user = GetConfigOption("discreet.app_user", true, false);
++	if (app_user != NULL && app_user[0] != '\0')
++	{
++		tenant = GetConfigOption("discreet.tenant", true, false);
++		req_id = GetConfigOption("discreet.request_id", true, false);
++		appendStringInfo(&buf, " | app_user: %s | tenant: %s | request_id: %s | validated: %s",
++						 app_user, tenant ? tenant : "none", req_id ? req_id : "none",
++						 _PGS_Discreet_IdentityTrusted("discreet.app_user") ? "true" : "false (client-asserted)");
++	}
++
++	elog(LOG, "%s", buf.data);
++
++	pfree(buf.data);
++	pfree(tables_buf.data);
++}
++
++
++/* ----------------------------------------------------------------
++ *		W1 (write side)
++ * ----------------------------------------------------------------
++ */
++
++/*
++ * DISCREET W1: Inspect row before persistent INSERT
++ *
++ * stage "entry": the row as ExecInsert receives it.
++ * stage "final": the row about to be stored, after BEFORE ROW triggers,
++ * generated columns and constraint checks (TC-05: final row timing).
++ */
++void
++_PGS_Discreet_W1_Insert(Relation rel, TupleTableSlot *slot, const char *stage)
++{
++	TupleDesc tupdesc = slot->tts_tupleDescriptor;
++	StringInfoData buf;
++	int i;
++
++	initStringInfo(&buf);
++	slot_getallattrs(slot);
++
++	appendStringInfo(&buf, "[DISCREET_W1] INSERT (%s) | Table: %s (OID: %u)",
++					 stage,
++					 RelationGetRelationName(rel),
++					 (unsigned int) RelationGetRelid(rel));
++
++	for (i = 0; i < tupdesc->natts; i++)
++	{
++		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++		bool isnull = slot->tts_isnull[i];
++
++		if (isnull)
++		{
++			appendStringInfo(&buf, " | %d (%s): NULL", i + 1, NameStr(attr->attname));
++		}
++		else
++		{
++			Oid typoutput;
++			bool typisvarlena;
++			char *val_str;
++
++			getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
++			val_str = OidOutputFunctionCall(typoutput, slot->tts_values[i]);
++			appendStringInfo(&buf, " | %d (%s): %s", i + 1, NameStr(attr->attname), val_str ? val_str : "");
++		}
++	}
++
++	elog(LOG, "%s", buf.data);
++	pfree(buf.data);
++}
++
++/*
++ * DISCREET W1: Inspect old and new values before persistent UPDATE
++ */
++void
++_PGS_Discreet_W1_Update(Relation rel, TupleTableSlot *slot, ItemPointer tupleid)
++{
++	TupleDesc tupdesc = slot->tts_tupleDescriptor;
++	TupleTableSlot *oldSlot = NULL;
++	StringInfoData buf;
++	int i;
++
++	initStringInfo(&buf);
++	slot_getallattrs(slot);
++
++	appendStringInfo(&buf, "[DISCREET_W1] UPDATE | Table: %s (OID: %u)",
++					 RelationGetRelationName(rel),
++					 (unsigned int) RelationGetRelid(rel));
++
++	/* Fetch old row image if possible to compare old and new values */
++	if (tupleid && ItemPointerIsValid(tupleid))
++	{
++		oldSlot = table_slot_create(rel, NULL);
++		if (!table_tuple_fetch_row_version(rel, tupleid, SnapshotAny, oldSlot))
++		{
++			ExecDropSingleTupleTableSlot(oldSlot);
++			oldSlot = NULL;
++		}
++		else
++		{
++			slot_getallattrs(oldSlot);
++		}
++	}
++
++	for (i = 0; i < tupdesc->natts; i++)
++	{
++		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++		char *new_val = "NULL";
++		char *old_val = "NULL";
++		bool new_null = slot->tts_isnull[i];
++		bool old_null = (oldSlot != NULL) ? oldSlot->tts_isnull[i] : true;
++		Oid typoutput;
++		bool typisvarlena;
++
++		getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
++
++		if (!new_null)
++			new_val = OidOutputFunctionCall(typoutput, slot->tts_values[i]);
++
++		if (oldSlot && !old_null)
++			old_val = OidOutputFunctionCall(typoutput, oldSlot->tts_values[i]);
++
++		/* Report changed column(s) */
++		if (new_null != old_null || (new_val && old_val && strcmp(new_val, old_val) != 0))
++		{
++			appendStringInfo(&buf, " | attnum: %d (%s) old_value: %s new_value: %s",
++							 i + 1, NameStr(attr->attname), old_val, new_val);
++		}
++	}
++
++	if (oldSlot)
++		ExecDropSingleTupleTableSlot(oldSlot);
++
++	elog(LOG, "%s", buf.data);
++	pfree(buf.data);
++}
++
++/*
++ * DISCREET W1: Inspect row before persistent DELETE
++ */
++void
++_PGS_Discreet_W1_Delete(Relation rel, ItemPointer tupleid)
++{
++	StringInfoData buf;
++	TupleTableSlot *oldSlot = NULL;
++	initStringInfo(&buf);
++
++	appendStringInfo(&buf, "[DISCREET_W1] DELETE | Table: %s (OID: %u)",
++					 RelationGetRelationName(rel),
++					 (unsigned int) RelationGetRelid(rel));
++
++	if (tupleid && ItemPointerIsValid(tupleid))
++	{
++		oldSlot = table_slot_create(rel, NULL);
++		if (table_tuple_fetch_row_version(rel, tupleid, SnapshotAny, oldSlot))
++		{
++			TupleDesc tupdesc = oldSlot->tts_tupleDescriptor;
++			int i;
++			slot_getallattrs(oldSlot);
++
++			for (i = 0; i < tupdesc->natts; i++)
++			{
++				Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++				if (!oldSlot->tts_isnull[i])
++				{
++					Oid typoutput;
++					bool typisvarlena;
++					char *val_str;
++
++					getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
++					val_str = OidOutputFunctionCall(typoutput, oldSlot->tts_values[i]);
++					appendStringInfo(&buf, " | %s: %s", NameStr(attr->attname), val_str ? val_str : "");
++				}
++				else
++				{
++					appendStringInfo(&buf, " | %s: NULL", NameStr(attr->attname));
++				}
++			}
++		}
++		ExecDropSingleTupleTableSlot(oldSlot);
++	}
++
++	appendStringInfoString(&buf, " | No new row image");
++
++	elog(LOG, "%s", buf.data);
++	pfree(buf.data);
++}
++
++
++/* ----------------------------------------------------------------
++ *		Integer shift: +10 on write (W1), -10 on read (R1)
++ *
++ * Integer columns (int2, int4, int8) of user tables are stored 10 higher
++ * than the client wrote them, so the table and every hook log line after
++ * the shift hold the shifted value, and SELECT gives the client back the
++ * original value.  Columns named "id", and foreign keys to them, are not
++ * shifted (_PGS_Discreet_IsIdColumn).  SET discreet.shift_integers = off
++ * disables it.
++ * ----------------------------------------------------------------
++ */
++
++#define DISCREET_SHIFT 10
++
++/* On unless discreet.shift_integers is set to a false value */
++static bool
++_PGS_Discreet_ShiftEnabled(void)
++{
++	const char *val = GetConfigOption("discreet.shift_integers", true, false);
++	bool		enabled;
++
++	if (val == NULL || val[0] == '\0' || !parse_bool(val, &enabled))
++		return true;
++	return enabled;
++}
++
++/* Only user tables are shifted: never system catalogs, TOAST or foreign tables. */
++static bool
++_PGS_Discreet_IsShiftedRel(Oid relid)
++{
++	char		relkind;
++
++	if (relid < FirstNormalObjectId)
++		return false;
++	relkind = get_rel_relkind(relid);
++	return relkind == RELKIND_RELATION || relkind == RELKIND_PARTITIONED_TABLE;
++}
++
++/*
++ * Columns the shift leaves alone: a column named "id", and a foreign key
++ * column that references one (so the foreign key still matches the stored
++ * id).  Write, read and the planner rewrite all use this test.
++ */
++static bool
++_PGS_Discreet_IsIdColumn(Oid relid, AttrNumber attnum)
++{
++	char	   *attname = get_attname(relid, attnum, true);
++	Relation	rel;
++	ListCell   *lc;
++	bool		result = false;
++
++	if (attname == NULL)
++		return false;
++	if (pg_strcasecmp(attname, "id") == 0)
++		return true;
++
++	rel = RelationIdGetRelation(relid);
++	if (!RelationIsValid(rel))
++		return false;
++	foreach(lc, RelationGetFKeyList(rel))
++	{
++		ForeignKeyCacheInfo *fk = lfirst_node(ForeignKeyCacheInfo, lc);
++
++		for (int i = 0; i < fk->nkeys && !result; i++)
++		{
++			if (fk->conkey[i] == attnum)
++			{
++				char	   *refname = get_attname(fk->confrelid, fk->confkey[i], true);
++
++				result = refname != NULL && pg_strcasecmp(refname, "id") == 0;
++			}
++		}
++		if (result)
++			break;
++	}
++	RelationClose(rel);
++	return result;
++}
++
++/*
++ * Does this output column come straight from a stored integer column?  R1
++ * subtracts 10 from exactly these, and the planner rewrite leaves exactly
++ * these for R1, so both must use this test.
++ */
++static bool
++_PGS_Discreet_OriginIsShifted(TargetEntry *tle, Oid typid)
++{
++	return OidIsValid(tle->resorigtbl) && tle->resorigcol > 0 &&
++		_PGS_Discreet_IsShiftedRel(tle->resorigtbl) &&
++		get_atttype(tle->resorigtbl, tle->resorigcol) == typid &&
++		!_PGS_Discreet_IsIdColumn(tle->resorigtbl, tle->resorigcol);
++}
++
++/* value + delta for int2/int4/int8: 1 done, 0 not an integer type, -1 out of range */
++static int
++_PGS_Discreet_ShiftDatum(Oid typid, Datum value, int delta, Datum *result)
++{
++	switch (typid)
++	{
++		case INT2OID:
++			{
++				int16		r;
++
++				if (pg_add_s16_overflow(DatumGetInt16(value), (int16) delta, &r))
++					return -1;
++				*result = Int16GetDatum(r);
++				return 1;
++			}
++		case INT4OID:
++			{
++				int32		r;
++
++				if (pg_add_s32_overflow(DatumGetInt32(value), (int32) delta, &r))
++					return -1;
++				*result = Int32GetDatum(r);
++				return 1;
++			}
++		case INT8OID:
++			{
++				int64		r;
++
++				if (pg_add_s64_overflow(DatumGetInt64(value), (int64) delta, &r))
++					return -1;
++				*result = Int64GetDatum(r);
++				return 1;
++			}
++		default:
++			return 0;
++	}
++}
++
++static char *
++_PGS_Discreet_ValueText(Oid typid, Datum value)
++{
++	Oid			typoutput;
++	bool		typisvarlena;
++
++	getTypeOutputInfo(typid, &typoutput, &typisvarlena);
++	return OidOutputFunctionCall(typoutput, value);
++}
++
++/*
++ * Add DISCREET_SHIFT to the integer columns of a row about to be written:
++ * every column, or (all_cols false) only the attnums in cols, offset by
++ * FirstLowInvalidHeapAttributeNumber as ExecGetUpdatedCols() returns them.
++ */
++static void
++_PGS_Discreet_ShiftWrite(EState *estate, Relation rel, TupleTableSlot *slot,
++					Bitmapset *cols, bool all_cols, const char *action)
++{
++	TupleDesc	tupdesc = slot->tts_tupleDescriptor;
++	int			natts = tupdesc->natts;
++	MemoryContext oldcxt;
++	Datum	   *values;
++	bool	   *nulls;
++	StringInfoData buf;
++	int			nshifted = 0;
++	int			i;
++
++	/* SQL inside the server (PL functions, triggers, FK checks) writes as is */
++	if (!_PGS_Discreet_ShiftEnabled() || _PGS_SPI_is_connected() ||
++		!_PGS_Discreet_IsShiftedRel(RelationGetRelid(rel)))
++		return;
++
++	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
++
++	slot_getallattrs(slot);
++	values = palloc_array(Datum, natts);
++	nulls = palloc_array(bool, natts);
++	memcpy(nulls, slot->tts_isnull, sizeof(*nulls) * natts);
++
++	initStringInfo(&buf);
++	appendStringInfo(&buf, "[DISCREET_SHIFT] %s +%d | Table: %s (OID: %u)",
++					 action, DISCREET_SHIFT,
++					 RelationGetRelationName(rel),
++					 (unsigned int) RelationGetRelid(rel));
++
++	for (i = 0; i < natts; i++)
++	{
++		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
++		CompactAttribute *cattr = TupleDescCompactAttr(tupdesc, i);
++
++		values[i] = slot->tts_values[i];
++		if (nulls[i])
++			continue;
++
++		if (!attr->attisdropped &&
++			(all_cols ||
++			 bms_is_member(i + 1 - FirstLowInvalidHeapAttributeNumber, cols)) &&
++			!_PGS_Discreet_IsIdColumn(RelationGetRelid(rel), (AttrNumber) (i + 1)))
++		{
++			Datum		stored;
++			int			res = _PGS_Discreet_ShiftDatum(attr->atttypid, values[i],
++												  DISCREET_SHIFT, &stored);
++
++			if (res < 0)
++				ereport(ERROR,
++						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
++						 errmsg("value %s in column \"%s\" is out of range after adding %d",
++								_PGS_Discreet_ValueText(attr->atttypid, values[i]),
++								NameStr(attr->attname), DISCREET_SHIFT)));
++			if (res > 0)
++			{
++				appendStringInfo(&buf, " | %d (%s): %s -> stored %s",
++								 i + 1, NameStr(attr->attname),
++								 _PGS_Discreet_ValueText(attr->atttypid, values[i]),
++								 _PGS_Discreet_ValueText(attr->atttypid, stored));
++				values[i] = stored;
++				nshifted++;
++				continue;
++			}
++		}
++
++		/* The slot is cleared below, so keep our own copy of the value */
++		values[i] = datumCopy(values[i], cattr->attbyval, cattr->attlen);
++	}
++
++	if (nshifted > 0)
++	{
++		ExecClearTuple(slot);
++		memcpy(slot->tts_values, values, sizeof(*values) * natts);
++		memcpy(slot->tts_isnull, nulls, sizeof(*nulls) * natts);
++		ExecStoreVirtualTuple(slot);
++		ExecMaterializeSlot(slot);
++
++		elog(LOG, "%s", buf.data);
++	}
++
++	MemoryContextSwitchTo(oldcxt);
++}
++
++/*
++ * DISCREET W1: shift the row ExecInsert is about to store.
++ *
++ * An UPDATE (or MERGE ... UPDATE) that moves a row to another partition also
++ * inserts it there; its other columns are already stored shifted, so only
++ * the columns the UPDATE sets are shifted.
++ */
++void
++_PGS_Discreet_W1_ShiftInsert(ModifyTableState *mtstate, ResultRelInfo *resultRelInfo,
++						TupleTableSlot *slot)
++{
++	EState	   *estate = mtstate->ps.state;
++	Relation	rel = resultRelInfo->ri_RelationDesc;
++	bool		row_move;
++
++	row_move = mtstate->operation == CMD_UPDATE ||
++		(mtstate->operation == CMD_MERGE &&
++		 mtstate->mt_merge_action != NULL &&
++		 mtstate->mt_merge_action->mas_action->commandType == CMD_UPDATE);
++
++	if (row_move)
++		_PGS_Discreet_ShiftWrite(estate, rel, slot,
++							ExecGetUpdatedCols(resultRelInfo, estate), false,
++							"UPDATE (row moved)");
++	else
++		_PGS_Discreet_ShiftWrite(estate, rel, slot, NULL, true, "INSERT");
++}
++
++/*
++ * DISCREET W1: shift the columns an UPDATE sets, just before the new row
++ * version is written.  The other columns come from the stored row and are
++ * already shifted.
++ */
++void
++_PGS_Discreet_W1_ShiftUpdate(ResultRelInfo *resultRelInfo, EState *estate,
++						TupleTableSlot *slot)
++{
++	_PGS_Discreet_ShiftWrite(estate, resultRelInfo->ri_RelationDesc, slot,
++						ExecGetUpdatedCols(resultRelInfo, estate), false,
++						"UPDATE");
++}
++
++/*
++ * DISCREET R1: give the client the original value back.  Called after
++ * _PGS_Discreet_R1_Intercept, so the READ log line shows the stored (+10) value.
++ *
++ * Only output columns that are a plain integer column of a user table are
++ * changed here.  Computed values (expressions, aggregates) already work on
++ * the original values: the planner rewrite below (_PGS_Discreet_PlannerRewrite)
++ * subtracts 10 from the column before using it.  Rows that stay inside the
++ * server (SPI: PL/pgSQL, triggers, foreign key checks) keep the stored values.
++ */
++void
++_PGS_Discreet_R1_Unshift(QueryDesc *queryDesc, TupleTableSlot *slot, uint64 row_num)
++{
++	PlannedStmt *stmt = queryDesc != NULL ? queryDesc->plannedstmt : NULL;
++	TupleDesc	tupdesc = slot->tts_tupleDescriptor;
++	int			natts = tupdesc->natts;
++	MemoryContext oldcxt;
++	Datum	   *values;
++	StringInfoData buf;
++	int			nshifted = 0;
++	ListCell   *lc;
++	int			i;
++
++	if (stmt == NULL || stmt->planTree == NULL || queryDesc->dest == NULL ||
++		queryDesc->estate == NULL || !_PGS_Discreet_ShiftEnabled() || _PGS_SPI_is_connected())
++		return;
++
++	/*
++	 * Rows leaving the query: to the client directly, through COPY TO, a
++	 * holdable cursor or a portal's store (tuplestore), or as the result of
++	 * an SQL function.
++	 */
++	switch (queryDesc->dest->mydest)
++	{
++		case DestRemote:
++		case DestRemoteExecute:
++		case DestRemoteSimple:
++		case DestCopyOut:
++		case DestTuplestore:
++		case DestSQLFunction:
++			break;
++		default:
++			return;
++	}
++
++	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(queryDesc->estate));
++
++	slot_getallattrs(slot);
++	values = palloc_array(Datum, natts);
++	memcpy(values, slot->tts_values, sizeof(*values) * natts);
++	initStringInfo(&buf);
++
++	foreach(lc, stmt->planTree->targetlist)
++	{
++		TargetEntry *tle = (TargetEntry *) lfirst(lc);
++		Form_pg_attribute attr;
++		Datum		original;
++
++		i = tle->resno - 1;
++		if (tle->resjunk || i < 0 || i >= natts || slot->tts_isnull[i])
++			continue;
++		attr = TupleDescAttr(tupdesc, i);
++		if (!_PGS_Discreet_OriginIsShifted(tle, attr->atttypid))
++			continue;
++
++		/* Not an integer, or a value too low to have been shifted: leave it */
++		if (_PGS_Discreet_ShiftDatum(attr->atttypid, values[i],
++								-DISCREET_SHIFT, &original) <= 0)
++			continue;
++
++		appendStringInfo(&buf, " | attnum %d (%s): stored %s -> returned %s",
++						 i + 1, NameStr(attr->attname),
++						 _PGS_Discreet_ValueText(attr->atttypid, values[i]),
++						 _PGS_Discreet_ValueText(attr->atttypid, original));
++		values[i] = original;
++		nshifted++;
++	}
++
++	if (nshifted > 0)
++	{
++		bool	   *nulls = palloc_array(bool, natts);
++
++		/*
++		 * Store the row as a new virtual tuple: some receivers (tuplestore)
++		 * read the slot's physical tuple rather than tts_values.  Copy the
++		 * other values first, since clearing the slot may release them.
++		 */
++		memcpy(nulls, slot->tts_isnull, sizeof(*nulls) * natts);
++		for (i = 0; i < natts; i++)
++		{
++			CompactAttribute *cattr = TupleDescCompactAttr(tupdesc, i);
++
++			if (!nulls[i] && !cattr->attbyval)
++				values[i] = datumCopy(values[i], cattr->attbyval, cattr->attlen);
++		}
++		ExecClearTuple(slot);
++		memcpy(slot->tts_values, values, sizeof(*values) * natts);
++		memcpy(slot->tts_isnull, nulls, sizeof(*nulls) * natts);
++		ExecStoreVirtualTuple(slot);
++		ExecMaterializeSlot(slot);
++
++		elog(LOG, "[DISCREET_SHIFT] READ -%d row %llu%s",
++			 DISCREET_SHIFT, (unsigned long long) row_num, buf.data);
++	}
++
++	MemoryContextSwitchTo(oldcxt);
++}
++
++
++/* ----------------------------------------------------------------
++ *		Integer shift in the planner: queries use the original values
++ *
++ * The table holds every integer column +10, so a client's
++ * "WHERE id = 1" has to look for the stored 11, and "salary * 12",
++ * "sum(salary)" or "SET qty = qty + 1" have to start from the stored value
++ * minus 10.  _PGS_Discreet_PlannerRewrite() rewrites each query the client sends,
++ * before it is planned:
++ *
++ *	- a comparison between a stored column and a value moves the shift to the
++ *	  value, so indexes still work:  id = 1  ->  id = 11,
++ *	  id IN (1, 2)  ->  id IN (11, 12),  id > $1  ->  id > $1 + 10;
++ *	- a comparison between two stored columns is left alone (both shifted);
++ *	- anywhere else a stored column is used it becomes (column - 10):
++ *	  salary * 12  ->  (salary - 10) * 12,  sum(salary) -> sum(salary - 10);
++ *	- INSERT ... SELECT, UPDATE SET, ON CONFLICT SET, MERGE and RETURNING use
++ *	  the original values too (W1 adds the 10 back when the row is written);
++ *	- a bare column in the SELECT list is left alone: R1 (_PGS_Discreet_R1_Unshift)
++ *	  subtracts the 10 as the row leaves, after the R1 log line has shown the
++ *	  stored value.
++ *
++ * SQL run inside the server (SPI: PL functions, triggers, foreign key checks
++ * and cascades) is not rewritten: it works on the stored values, so a
++ * foreign key compares stored with stored.
++ * ----------------------------------------------------------------
++ */
++
++typedef struct DiscreetShiftContext
++{
++	List	   *levels;			/* Query at varlevelsup 0, 1, 2, ... */
++	Query	   *sublink;		/* subselect the PARAM_SUBLINK Params refer to */
++} DiscreetShiftContext;
++
++static void _PGS_Discreet_RewriteQuery(Query *query, List *outer, bool top, bool setop_leaf);
++static Node *_PGS_Discreet_UnshiftMutator(Node *node, DiscreetShiftContext *ctx);
++static bool _PGS_Discreet_IsShiftedLeaf(Node *node, List *levels, Query *sublink);
++
++static bool
++_PGS_Discreet_IsShiftType(Oid typid)
++{
++	return typid == INT2OID || typid == INT4OID || typid == INT8OID;
++}
++
++/* expr + delta (or - for a negative delta), in expr's own integer type */
++static Node *
++_PGS_Discreet_MakeShift(Node *expr, int delta)
++{
++	Oid			typid = exprType(expr);
++	int16		typlen;
++	bool		typbyval;
++	Datum		amount;
++	Oid			opno;
++	Expr	   *op;
++
++	switch (typid)
++	{
++		case INT2OID:
++			amount = Int16GetDatum((int16) abs(delta));
++			break;
++		case INT4OID:
++			amount = Int32GetDatum(abs(delta));
++			break;
++		default:
++			amount = Int64GetDatum((int64) abs(delta));
++			break;
++	}
++	get_typlenbyval(typid, &typlen, &typbyval);
++	opno = OpernameGetOprid(list_make2(makeString("pg_catalog"),
++									   makeString(delta < 0 ? "-" : "+")),
++							typid, typid);
++	if (!OidIsValid(opno))
++		elog(ERROR, "integer operator for type %u not found", typid);
++
++	op = make_opclause(opno, typid, false, (Expr *) expr,
++					   (Expr *) makeConst(typid, -1, InvalidOid, typlen,
++										  amount, false, typbyval),
++					   InvalidOid, InvalidOid);
++	set_opfuncid((OpExpr *) op);
++	return (Node *) op;
++}
++
++/* A value the client wrote, as stored (+10); NULL when that is not possible */
++static Node *
++_PGS_Discreet_ToStored(Node *expr)
++{
++	if (IsA(expr, Const))
++	{
++		Const	   *c = (Const *) expr;
++		Datum		stored;
++
++		/* NULL, or too large to shift: the caller falls back */
++		if (c->constisnull ||
++			_PGS_Discreet_ShiftDatum(c->consttype, c->constvalue,
++								DISCREET_SHIFT, &stored) <= 0)
++			return NULL;
++		c = copyObject(c);
++		c->constvalue = stored;
++		return (Node *) c;
++	}
++	if (!_PGS_Discreet_IsShiftType(exprType(expr)))
++		return NULL;
++	return _PGS_Discreet_MakeShift(expr, DISCREET_SHIFT);
++}
++
++/* A constant integer array with every element +10; NULL when not possible */
++static Node *
++_PGS_Discreet_ArrayToStored(Node *expr, Oid elemtype)
++{
++	Const	   *c;
++	ArrayType  *arr;
++	Datum	   *elems;
++	bool	   *nulls;
++	int			nelems;
++	int16		typlen;
++	bool		typbyval;
++	char		typalign;
++	int			i;
++
++	if (!IsA(expr, Const) || ((Const *) expr)->constisnull)
++		return NULL;
++	c = (Const *) expr;
++	arr = DatumGetArrayTypeP(c->constvalue);
++	if (ARR_NDIM(arr) != 1)
++		return NULL;
++
++	get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
++	deconstruct_array(arr, elemtype, typlen, typbyval, typalign,
++					  &elems, &nulls, &nelems);
++	for (i = 0; i < nelems; i++)
++	{
++		if (nulls[i] ||
++			_PGS_Discreet_ShiftDatum(elemtype, elems[i], DISCREET_SHIFT, &elems[i]) <= 0)
++			return NULL;
++	}
++
++	c = copyObject(c);
++	c->constvalue = PointerGetDatum(construct_array(elems, nelems, elemtype,
++													typlen, typbyval, typalign));
++	return (Node *) c;
++}
++
++/* =, <>, <, >, <= or >= between two built-in integer types */
++static bool
++_PGS_Discreet_IsIntComparison(Oid opno, Oid ltype, Oid rtype)
++{
++	char	   *name;
++
++	if (opno >= FirstNormalObjectId ||
++		!_PGS_Discreet_IsShiftType(ltype) || !_PGS_Discreet_IsShiftType(rtype))
++		return false;
++	name = get_opname(opno);
++	return name != NULL &&
++		(strcmp(name, "=") == 0 || strcmp(name, "<>") == 0 ||
++		 strcmp(name, "<") == 0 || strcmp(name, ">") == 0 ||
++		 strcmp(name, "<=") == 0 || strcmp(name, ">=") == 0);
++}
++
++/*
++ * Is output column resno of this query a stored (shifted) value?  The
++ * leaves of UNION/INTERSECT/EXCEPT and RETURNING lists are rewritten to the
++ * original values, so those never are.
++ */
++static bool
++_PGS_Discreet_IsShiftedOutput(Query *query, AttrNumber resno, List *outer)
++{
++	TargetEntry *tle;
++
++	if (query == NULL || query->commandType != CMD_SELECT ||
++		query->setOperations != NULL)
++		return false;
++	tle = get_tle_by_resno(query->targetList, resno);
++	if (tle == NULL || tle->resjunk)
++		return false;
++	return _PGS_Discreet_IsShiftedLeaf((Node *) tle->expr, lcons(query, list_copy(outer)), NULL);
++}
++
++/*
++ * Is this node, as it is, a stored (shifted) integer value?  That is a
++ * column of a user table, or something that passes one through unchanged:
++ * a subquery, view, CTE, join or GROUP BY column, or a scalar subquery,
++ * whose value is such a column.
++ */
++static bool
++_PGS_Discreet_IsShiftedLeaf(Node *node, List *levels, Query *sublink)
++{
++	if (node == NULL)
++		return false;
++
++	if (IsA(node, Var))
++	{
++		Var		   *var = (Var *) node;
++		Query	   *query;
++		RangeTblEntry *rte;
++
++		if (var->varattno <= 0 || !_PGS_Discreet_IsShiftType(var->vartype) ||
++			var->varlevelsup >= list_length(levels))
++			return false;
++		levels = list_copy_tail(levels, var->varlevelsup);
++		query = (Query *) linitial(levels);
++		if (var->varno < 1 || var->varno > list_length(query->rtable))
++			return false;
++		rte = rt_fetch(var->varno, query->rtable);
++
++		switch (rte->rtekind)
++		{
++			case RTE_RELATION:
++				return _PGS_Discreet_IsShiftedRel(rte->relid) &&
++					get_atttype(rte->relid, var->varattno) == var->vartype &&
++					!_PGS_Discreet_IsIdColumn(rte->relid, var->varattno);
++
++			case RTE_SUBQUERY:
++				return _PGS_Discreet_IsShiftedOutput(rte->subquery, var->varattno, levels);
++
++			case RTE_JOIN:
++				{
++					Node	   *alias;
++
++					if (var->varattno > list_length(rte->joinaliasvars))
++						return false;
++					alias = (Node *) list_nth(rte->joinaliasvars, var->varattno - 1);
++
++					/* FULL JOIN USING: COALESCE of the two sides */
++					if (alias != NULL && IsA(alias, CoalesceExpr))
++					{
++						ListCell   *lc;
++
++						foreach(lc, ((CoalesceExpr *) alias)->args)
++						{
++							if (!_PGS_Discreet_IsShiftedLeaf((Node *) lfirst(lc), levels, NULL))
++								return false;
++						}
++						return true;
++					}
++					return _PGS_Discreet_IsShiftedLeaf(alias, levels, NULL);
++				}
++
++			case RTE_CTE:
++				{
++					List	   *ctelevels;
++					ListCell   *lc;
++
++					if (rte->ctelevelsup >= list_length(levels))
++						return false;
++					ctelevels = list_copy_tail(levels, rte->ctelevelsup);
++					foreach(lc, ((Query *) linitial(ctelevels))->cteList)
++					{
++						CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
++
++						if (strcmp(cte->ctename, rte->ctename) != 0)
++							continue;
++						if (cte->cterecursive || !IsA(cte->ctequery, Query))
++							return false;
++						return _PGS_Discreet_IsShiftedOutput((Query *) cte->ctequery,
++														var->varattno, ctelevels);
++					}
++					return false;
++				}
++
++			case RTE_GROUP:
++				if (var->varattno > list_length(rte->groupexprs))
++					return false;
++				return _PGS_Discreet_IsShiftedLeaf((Node *) list_nth(rte->groupexprs,
++																var->varattno - 1),
++											  levels, NULL);
++
++			default:
++				return false;
++		}
++	}
++
++	/* "x IN (SELECT col ...)": the Param stands for the subselect's column */
++	if (IsA(node, Param))
++	{
++		Param	   *param = (Param *) node;
++
++		if (sublink == NULL || param->paramkind != PARAM_SUBLINK)
++			return false;
++		return _PGS_Discreet_IsShiftedOutput(sublink, param->paramid, levels);
++	}
++
++	/* A scalar subquery "(SELECT col ...)" */
++	if (IsA(node, SubLink))
++	{
++		SubLink    *sl = (SubLink *) node;
++
++		if (sl->subLinkType != EXPR_SUBLINK || !IsA(sl->subselect, Query))
++			return false;
++		return _PGS_Discreet_IsShiftedOutput((Query *) sl->subselect, 1, levels);
++	}
++
++	return false;
++}
++
++/* A copy of a SubLink with its subquery and test expression rewritten */
++static Node *
++_PGS_Discreet_RewriteSubLink(SubLink *sl, DiscreetShiftContext *ctx)
++{
++	SubLink    *newsl = copyObject(sl);
++	DiscreetShiftContext subctx;
++
++	_PGS_Discreet_RewriteQuery((Query *) newsl->subselect, ctx->levels, false, false);
++
++	subctx.levels = ctx->levels;
++	subctx.sublink = (Query *) newsl->subselect;
++	newsl->testexpr = _PGS_Discreet_UnshiftMutator(newsl->testexpr, &subctx);
++	return (Node *) newsl;
++}
++
++/* A stored leaf, kept stored (only a scalar subquery needs rewriting inside) */
++static Node *
++_PGS_Discreet_KeepStored(Node *leaf, DiscreetShiftContext *ctx)
++{
++	if (IsA(leaf, SubLink))
++		return _PGS_Discreet_RewriteSubLink((SubLink *) leaf, ctx);
++	return (Node *) copyObject(leaf);
++}
++
++/*
++ * Rewrite an expression so it computes on original values (see the section
++ * comment).  Returns a new tree.
++ */
++static Node *
++_PGS_Discreet_UnshiftMutator(Node *node, DiscreetShiftContext *ctx)
++{
++	if (node == NULL)
++		return NULL;
++
++	/* GROUPING() arguments must stay identical to the GROUP BY expressions */
++	if (IsA(node, GroupingFunc))
++		return (Node *) copyObject(node);
++
++	if (_PGS_Discreet_IsShiftedLeaf(node, ctx->levels, ctx->sublink))
++		return _PGS_Discreet_MakeShift(_PGS_Discreet_KeepStored(node, ctx), -DISCREET_SHIFT);
++
++	if (IsA(node, SubLink))
++		return _PGS_Discreet_RewriteSubLink((SubLink *) node, ctx);
++
++	if (IsA(node, OpExpr))
++	{
++		OpExpr	   *op = (OpExpr *) node;
++
++		if (list_length(op->args) == 2 &&
++			_PGS_Discreet_IsIntComparison(op->opno,
++									 exprType(linitial(op->args)),
++									 exprType(lsecond(op->args))))
++		{
++			Node	   *l = (Node *) linitial(op->args);
++			Node	   *r = (Node *) lsecond(op->args);
++			bool		lstored = _PGS_Discreet_IsShiftedLeaf(l, ctx->levels, ctx->sublink);
++			bool		rstored = _PGS_Discreet_IsShiftedLeaf(r, ctx->levels, ctx->sublink);
++			OpExpr	   *newop;
++
++			/* stored column vs stored column: both +10, compare as they are */
++			if (lstored && rstored)
++			{
++				newop = makeNode(OpExpr);
++				memcpy(newop, op, sizeof(OpExpr));
++				newop->args = list_make2(_PGS_Discreet_KeepStored(l, ctx),
++										 _PGS_Discreet_KeepStored(r, ctx));
++				return (Node *) newop;
++			}
++
++			/* stored column vs a value: compare with the value + 10 */
++			if (lstored != rstored)
++			{
++				Node	   *value = _PGS_Discreet_UnshiftMutator(lstored ? r : l, ctx);
++				Node	   *stored = _PGS_Discreet_ToStored(value);
++
++				if (stored != NULL)
++				{
++					Node	   *column = _PGS_Discreet_KeepStored(lstored ? l : r, ctx);
++
++					newop = makeNode(OpExpr);
++					memcpy(newop, op, sizeof(OpExpr));
++					newop->args = lstored ? list_make2(column, stored)
++						: list_make2(stored, column);
++					return (Node *) newop;
++				}
++				/* else fall through: (column - 10) compared with the value */
++			}
++		}
++	}
++
++	/* col IN (1, 2, 3), col = ANY ($1): shift the list, not the column */
++	if (IsA(node, ScalarArrayOpExpr))
++	{
++		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
++
++		if (list_length(saop->args) == 2)
++		{
++			Node	   *scalar = (Node *) linitial(saop->args);
++			Node	   *array = (Node *) lsecond(saop->args);
++			Oid			elemtype = get_element_type(exprType(array));
++
++			if (_PGS_Discreet_IsIntComparison(saop->opno, exprType(scalar), elemtype) &&
++				_PGS_Discreet_IsShiftedLeaf(scalar, ctx->levels, ctx->sublink))
++			{
++				Node	   *values = _PGS_Discreet_UnshiftMutator(array, ctx);
++				Node	   *stored = NULL;
++
++				if (IsA(values, Const))
++					stored = _PGS_Discreet_ArrayToStored(values, elemtype);
++				else if (IsA(values, ArrayExpr))
++				{
++					ArrayExpr  *arr = (ArrayExpr *) copyObject(values);
++					ListCell   *lc;
++
++					stored = (Node *) arr;
++					foreach(lc, arr->elements)
++					{
++						Node	   *elem = _PGS_Discreet_ToStored((Node *) lfirst(lc));
++
++						if (elem == NULL)
++						{
++							stored = NULL;
++							break;
++						}
++						lfirst(lc) = elem;
++					}
++				}
++
++				if (stored != NULL)
++				{
++					ScalarArrayOpExpr *newsaop = makeNode(ScalarArrayOpExpr);
++
++					memcpy(newsaop, saop, sizeof(ScalarArrayOpExpr));
++					newsaop->args = list_make2(_PGS_Discreet_KeepStored(scalar, ctx), stored);
++					return (Node *) newsaop;
++				}
++			}
++		}
++	}
++
++	return expression_tree_mutator(node, _PGS_Discreet_UnshiftMutator, ctx);
++}
++
++/*
++ * SELECT list: a bare stored column stays stored.  At the top level R1
++ * subtracts the 10 as the row leaves (it finds the column through
++ * resorigtbl), and in a subquery the outer query sees it as stored.
++ * Everything else computes on original values.
++ */
++static void
++_PGS_Discreet_RewriteSelectList(List *tlist, DiscreetShiftContext *ctx, bool top)
++{
++	ListCell   *lc;
++
++	foreach(lc, tlist)
++	{
++		TargetEntry *tle = (TargetEntry *) lfirst(lc);
++		Node	   *expr = (Node *) tle->expr;
++		bool		keep = false;
++
++		/* at the top, only what R1 will find (a view column is not) */
++		if (_PGS_Discreet_IsShiftedLeaf(expr, ctx->levels, NULL))
++			keep = top ? (IsA(expr, Var) &&
++						  _PGS_Discreet_OriginIsShifted(tle, exprType(expr))) : true;
++
++		tle->expr = (Expr *) (keep ? _PGS_Discreet_KeepStored(expr, ctx)
++							  : _PGS_Discreet_UnshiftMutator(expr, ctx));
++	}
++}
++
++/*
++ * Values being written or returned (INSERT, UPDATE SET, MERGE, ON CONFLICT
++ * SET, RETURNING, UNION leaves): all original values.
++ */
++static void
++_PGS_Discreet_RewriteValueList(List *tlist, DiscreetShiftContext *ctx, bool clear_origin)
++{
++	ListCell   *lc;
++
++	foreach(lc, tlist)
++	{
++		TargetEntry *tle = (TargetEntry *) lfirst(lc);
++
++		tle->expr = (Expr *) _PGS_Discreet_UnshiftMutator((Node *) tle->expr, ctx);
++		if (clear_origin)
++		{
++			/* already original: R1 must not subtract again */
++			tle->resorigtbl = InvalidOid;
++			tle->resorigcol = 0;
++		}
++	}
++}
++
++static void
++_PGS_Discreet_RewriteQuery(Query *query, List *outer, bool top, bool setop_leaf)
++{
++	DiscreetShiftContext ctx;
++	ListCell   *lc;
++
++	if (query == NULL || query->commandType == CMD_UTILITY)
++		return;
++
++	/* lcons() can change the list it is given, and outer belongs to the caller */
++	ctx.levels = lcons(query, list_copy(outer));
++	ctx.sublink = NULL;
++
++	foreach(lc, query->cteList)
++	{
++		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
++
++		if (IsA(cte->ctequery, Query))
++			_PGS_Discreet_RewriteQuery((Query *) cte->ctequery, ctx.levels, false, false);
++	}
++
++	/* Subqueries first, so the outer query sees which of their columns are stored */
++	foreach(lc, query->rtable)
++	{
++		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
++
++		switch (rte->rtekind)
++		{
++			case RTE_SUBQUERY:
++				_PGS_Discreet_RewriteQuery(rte->subquery, ctx.levels, false,
++									  query->setOperations != NULL);
++				break;
++			case RTE_FUNCTION:
++				{
++					ListCell   *fl;
++
++					foreach(fl, rte->functions)
++					{
++						RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(fl);
++
++						rtfunc->funcexpr = _PGS_Discreet_UnshiftMutator(rtfunc->funcexpr, &ctx);
++					}
++				}
++				break;
++			case RTE_VALUES:
++				rte->values_lists = (List *)
++					_PGS_Discreet_UnshiftMutator((Node *) rte->values_lists, &ctx);
++				break;
++			case RTE_GROUP:
++				{
++					ListCell   *gl;
++
++					/* GROUP BY col stays stored; GROUP BY expressions compute */
++					foreach(gl, rte->groupexprs)
++					{
++						Node	   *expr = (Node *) lfirst(gl);
++
++						if (_PGS_Discreet_IsShiftedLeaf(expr, ctx.levels, NULL))
++							lfirst(gl) = _PGS_Discreet_KeepStored(expr, &ctx);
++						else
++							lfirst(gl) = _PGS_Discreet_UnshiftMutator(expr, &ctx);
++					}
++				}
++				break;
++			default:
++				break;
++		}
++
++		/* Row-level security policies (USING) filter like WHERE */
++		if (rte->securityQuals != NIL)
++			rte->securityQuals = (List *)
++				_PGS_Discreet_UnshiftMutator((Node *) rte->securityQuals, &ctx);
++	}
++
++	/* WHERE, JOIN ... ON and HAVING */
++	query->jointree = (FromExpr *)
++		_PGS_Discreet_UnshiftMutator((Node *) query->jointree, &ctx);
++	query->havingQual = _PGS_Discreet_UnshiftMutator(query->havingQual, &ctx);
++
++	switch (query->commandType)
++	{
++		case CMD_SELECT:
++			if (setop_leaf)
++				_PGS_Discreet_RewriteValueList(query->targetList, &ctx, false);
++			else if (query->setOperations == NULL)
++				_PGS_Discreet_RewriteSelectList(query->targetList, &ctx, top);
++			break;
++		case CMD_INSERT:
++		case CMD_UPDATE:
++			_PGS_Discreet_RewriteValueList(query->targetList, &ctx, false);
++			break;
++		default:
++			break;
++	}
++
++	if (query->commandType == CMD_MERGE)
++	{
++		foreach(lc, query->mergeActionList)
++		{
++			MergeAction *action = (MergeAction *) lfirst(lc);
++
++			action->qual = _PGS_Discreet_UnshiftMutator(action->qual, &ctx);
++			_PGS_Discreet_RewriteValueList(action->targetList, &ctx, false);
++		}
++		query->mergeJoinCondition =
++			_PGS_Discreet_UnshiftMutator(query->mergeJoinCondition, &ctx);
++	}
++
++	if (query->onConflict != NULL)
++	{
++		_PGS_Discreet_RewriteValueList(query->onConflict->onConflictSet, &ctx, false);
++		query->onConflict->onConflictWhere =
++			_PGS_Discreet_UnshiftMutator(query->onConflict->onConflictWhere, &ctx);
++	}
++
++	_PGS_Discreet_RewriteValueList(query->returningList, &ctx, true);
++}
++
++/*
++ * Called from planner() for every query before it is planned: rewrite the
++ * client's queries to use the original values.
++ */
++void
++_PGS_Discreet_PlannerRewrite(Query *parse)
++{
++	if (!_PGS_Discreet_ShiftEnabled() || _PGS_SPI_is_connected())
++		return;
++	_PGS_Discreet_RewriteQuery(parse, NIL, true, false);
++}
+diff --git a/src/backend/executor/runtime_security.c b/src/backend/executor/runtime_security.c
+new file mode 100644
+index 00000000000..6b84154061d
+--- /dev/null
++++ b/src/backend/executor/runtime_security.c
+@@ -0,0 +1,663 @@
++/*
++ * NOT BUILT (kept for reference): this code now lives in execMain.c
++ * (statement end, SPI, login / logout, transaction callbacks, sending)
++ * and nodeModifyTable.c (_PGS_RuntimeSecurity_CaptureRow).  The file is no
++ * longer in src/backend/executor/meson.build.
++ */
++/*-------------------------------------------------------------------------
++ *
++ * runtime_security.c
++ *	  Runtime security check: executor hooks on the tenant, user and
++ *	  role-asset tables ("Schema for Runtime Security Check").
++ *
++ * The tables are made by role_asset_schema.sql.  The hooks find them by
++ * table name, in whatever schema the statement wrote to:
++ *
++ *	INSERT INTO tenant          the tenant is sent to AM
++ *	INSERT INTO tenant_user     the user is sent to AM (username, role)
++ *	UPDATE tenant_user SET status = 1   login: user_asset_map gets a row per
++ *	                            asset of the user's role (a copy of
++ *	                            role_asset_map), and asset_key is set to the
++ *	                            value AM returns for each asset
++ *	UPDATE tenant_user SET status = 0   logout: the user's asset keys are
++ *	                            removed
++ *	INSERT/UPDATE/DELETE on app_role, app_asset or role_asset_map
++ *	                            (the one-time role_asset_data.sql) the
++ *	                            role-asset matrix is sent to AM
++ *
++ * ExecModifyTable() calls _PGS_RuntimeSecurity_CaptureRow() for each row, which
++ * only remembers the row's id.  standard_ExecutorFinish() calls
++ * _PGS_RuntimeSecurity_StatementEnd(), which reads the rows back with SPI, does
++ * the login/logout work and builds the JSON for AM.  Login asks AM for the
++ * values at once, as they are stored in the same transaction.  The tenant,
++ * user and matrix are sent when the transaction commits, so a rolled-back
++ * INSERT sends nothing.  The HTTP calls are in am_client.cpp.
++ *
++ * src/backend/executor/runtime_security.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include "access/sysattr.h"
++#include "access/xact.h"
++#include "catalog/pg_type.h"
++#include "executor/am_client.h"
++#include "executor/executor.h"
++#include "executor/runtime_security.h"
++#include "executor/spi.h"
++#include "miscadmin.h"
++#include "parser/parse_relation.h"
++#include "utils/builtins.h"
++#include "utils/lsyscache.h"
++#include "utils/memutils.h"
++#include "utils/rel.h"
++
++/*
++ * asset_key in user_asset_map: a 32-byte key, base64 (44 characters: 43
++ * and one '='). AM values of any other size are not stored.
++ */
++#define RSC_KEY_BYTES 32
++#define RSC_KEY_PATTERN "^[A-Za-z0-9+/]{43}=$"
++
++typedef enum RscEventKind
++{
++	RSC_TENANT_CREATED,
++	RSC_USER_CREATED,
++	RSC_USER_STATUS,
++	RSC_MATRIX_CHANGED,
++} RscEventKind;
++
++/* A row caught in ExecModifyTable, handled at the end of its statement */
++typedef struct RscEvent
++{
++	RscEventKind kind;
++	EState	   *estate;			/* statement that wrote the row */
++	int			nestlevel;		/* (sub)transaction that wrote it */
++	char	   *schema;			/* schema of the table written */
++	int64		id;				/* tenant_id or user_id */
++} RscEvent;
++
++/* A call to AM, made when the transaction commits */
++typedef struct RscSend
++{
++	int			nestlevel;
++	const char *endpoint;		/* "tenants", "users" or "roles" */
++	int64		tenant_id;		/* picks the API key; 0 = default key */
++	char	   *body;
++} RscSend;
++
++/* Both lists live in TopTransactionContext */
++static List *pending_events = NIL;
++static List *pending_sends = NIL;
++static bool callbacks_registered = false;
++static bool rsc_busy = false;	/* running our own SPI queries */
++
++static void _PGS_rsc_xact_callback(XactEvent event, void *arg);
++static void _PGS_rsc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
++								 SubTransactionId parentSubid, void *arg);
++
++static bool
++_PGS_rsc_is_matrix_table(const char *relname)
++{
++	return strcmp(relname, "role_asset_map") == 0 ||
++		strcmp(relname, "app_role") == 0 ||
++		strcmp(relname, "app_asset") == 0;
++}
++
++/* The bigint id column of a captured row, or false if it has none */
++static bool
++_PGS_rsc_row_id(Relation rel, TupleTableSlot *slot, const char *column, int64 *id)
++{
++	AttrNumber	attnum = attnameAttNum(rel, column, false);
++	Datum		value;
++	bool		isnull;
++
++	if (attnum <= 0 || slot == NULL || TupIsNull(slot))
++		return false;
++	value = slot_getattr(slot, attnum, &isnull);
++	if (isnull)
++		return false;
++
++	switch (TupleDescAttr(RelationGetDescr(rel), attnum - 1)->atttypid)
++	{
++		case INT8OID:
++			*id = DatumGetInt64(value);
++			return true;
++		case INT4OID:
++			*id = DatumGetInt32(value);
++			return true;
++		default:
++			return false;
++	}
++}
++
++/*
++ * Called by ExecModifyTable() for each row it inserts, updates or deletes
++ * (slot is the new row; NULL for DELETE and MERGE).  Remembers the rows of
++ * the runtime security tables; everything else returns at once.
++ */
++void
++_PGS_RuntimeSecurity_CaptureRow(ModifyTableState *mtstate,
++						   ResultRelInfo *resultRelInfo,
++						   CmdType operation,
++						   TupleTableSlot *slot)
++{
++	Relation	rel = resultRelInfo->ri_RelationDesc;
++	EState	   *estate = mtstate->ps.state;
++	const char *relname = RelationGetRelationName(rel);
++	RscEventKind kind;
++	int64		id = 0;
++	MemoryContext oldcxt;
++	RscEvent   *ev;
++
++	if (rsc_busy || !IsNormalProcessingMode())
++		return;
++
++	if (_PGS_rsc_is_matrix_table(relname))
++	{
++		ListCell   *lc;
++
++		/* One matrix event per statement is enough */
++		foreach(lc, pending_events)
++		{
++			RscEvent   *e = (RscEvent *) lfirst(lc);
++
++			if (e->kind == RSC_MATRIX_CHANGED && e->estate == estate)
++				return;
++		}
++		kind = RSC_MATRIX_CHANGED;
++	}
++	else if (strcmp(relname, "tenant") == 0 && operation == CMD_INSERT)
++	{
++		if (!_PGS_rsc_row_id(rel, slot, "tenant_id", &id))
++			return;
++		kind = RSC_TENANT_CREATED;
++	}
++	else if (strcmp(relname, "tenant_user") == 0 && operation == CMD_INSERT)
++	{
++		if (!_PGS_rsc_row_id(rel, slot, "user_id", &id))
++			return;
++		kind = RSC_USER_CREATED;
++	}
++	else if (strcmp(relname, "tenant_user") == 0 && operation == CMD_UPDATE)
++	{
++		AttrNumber	status = attnameAttNum(rel, "status", false);
++
++		/* Only an UPDATE that sets the status is a login or logout */
++		if (status <= 0 ||
++			!bms_is_member(status - FirstLowInvalidHeapAttributeNumber,
++						   ExecGetUpdatedCols(resultRelInfo, estate)))
++			return;
++		if (!_PGS_rsc_row_id(rel, slot, "user_id", &id))
++			return;
++		kind = RSC_USER_STATUS;
++	}
++	else
++		return;
++
++	if (!callbacks_registered)
++	{
++		RegisterXactCallback(_PGS_rsc_xact_callback, NULL);
++		RegisterSubXactCallback(_PGS_rsc_subxact_callback, NULL);
++		callbacks_registered = true;
++	}
++
++	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	ev = palloc(sizeof(RscEvent));
++	ev->kind = kind;
++	ev->estate = estate;
++	ev->nestlevel = GetCurrentTransactionNestLevel();
++	ev->schema = get_namespace_name(RelationGetNamespace(rel));
++	ev->id = id;
++	pending_events = lappend(pending_events, ev);
++	MemoryContextSwitchTo(oldcxt);
++}
++
++/* ---------------------------------------------------------------- SPI */
++
++/* Run a query with $1 = id (bigint) and, if given, $2 = arg (text) */
++static uint64
++_PGS_rsc_exec(const char *sql, int64 id, const char *arg)
++{
++	Oid			types[2] = {INT8OID, TEXTOID};
++	Datum		values[2];
++	int			ret;
++
++	values[0] = Int64GetDatum(id);
++	if (arg != NULL)
++		values[1] = CStringGetTextDatum(arg);
++
++	ret = SPI_execute_with_args(sql, arg != NULL ? 2 : 1, types, values,
++								NULL, false, 0);
++	if (ret < 0)
++		elog(ERROR, "runtime security: query failed (%s): %s",
++			 SPI_result_code_string(ret), sql);
++	return SPI_processed;
++}
++
++/* Column col (1-based) of the first result row, NULL if it is null */
++static char *
++_PGS_rsc_value(int col)
++{
++	return SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, col);
++}
++
++/* Queue a call to AM for commit */
++static void
++_PGS_rsc_queue_send(const char *endpoint, int64 tenant_id, const char *body)
++{
++	MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	RscSend    *s;
++
++	/* The matrix is sent whole, so only its latest version is kept */
++	if (strcmp(endpoint, "roles") == 0)
++	{
++		List	   *keep = NIL;
++		ListCell   *lc;
++
++		foreach(lc, pending_sends)
++		{
++			RscSend    *old = (RscSend *) lfirst(lc);
++
++			if (strcmp(old->endpoint, "roles") != 0)
++				keep = lappend(keep, old);
++		}
++		pending_sends = keep;
++	}
++
++	s = palloc(sizeof(RscSend));
++	s->nestlevel = GetCurrentTransactionNestLevel();
++	s->endpoint = endpoint;
++	s->tenant_id = tenant_id;
++	s->body = pstrdup(body);
++	pending_sends = lappend(pending_sends, s);
++	MemoryContextSwitchTo(oldcxt);
++}
++
++/* ------------------------------------------------------- login / logout */
++
++/*
++ * Login (status 1): copy the user's role assets from role_asset_map into
++ * user_asset_map and store the value AM returns for each as asset_key.
++ */
++static void
++_PGS_rsc_login(const char *q, int64 user_id, int64 tenant_id, const char *username)
++{
++	char	   *response = NULL;
++	char		errbuf[256];
++	int			status;
++	uint64		n;
++
++	/* Assets the role no longer grants */
++	_PGS_rsc_exec(psprintf("DELETE FROM %s.user_asset_map k "
++					  "WHERE k.user_id = $1 AND NOT EXISTS ("
++					  " SELECT 1 FROM %s.role_asset_map m"
++					  " JOIN %s.tenant_user u ON u.role_id = m.app_role_id"
++					  " WHERE u.user_id = $1 AND m.app_asset_id = k.asset_id)",
++					  q, q, q), user_id, NULL);
++	/* A row per asset of the role */
++	_PGS_rsc_exec(psprintf("INSERT INTO %s.user_asset_map (asset_id, user_id) "
++					  "SELECT m.app_asset_id, u.user_id FROM %s.role_asset_map m"
++					  " JOIN %s.tenant_user u ON u.role_id = m.app_role_id"
++					  " WHERE u.user_id = $1 "
++					  "ON CONFLICT (user_id, asset_id) DO NOTHING",
++					  q, q, q), user_id, NULL);
++	/* No key from an earlier session survives */
++	_PGS_rsc_exec(psprintf("UPDATE %s.user_asset_map SET asset_key = NULL "
++					  "WHERE user_id = $1 AND asset_key IS NOT NULL", q),
++			 user_id, NULL);
++
++	status = _PGS_AmClient_Call("user_assets", username, tenant_id, NULL,
++						   &response, errbuf, sizeof(errbuf));
++	if (status == 0)
++	{
++		ereport(LOG,
++				(errmsg("runtime security: login of user %lld: AM is not configured (am_client.conf), no asset keys stored",
++						(long long) user_id)));
++		_PGS_AmClient_Free(response);
++		return;
++	}
++	if (status != 200 || response == NULL)
++	{
++		ereport(WARNING,
++				(errmsg("runtime security: login of user %lld: could not get the asset values from AM",
++						(long long) user_id),
++				 status < 0 ? errdetail("%s", errbuf) :
++				 errdetail("AM answered HTTP %d.", status)));
++		_PGS_AmClient_Free(response);
++		return;
++	}
++
++	/* PostgreSQL parses AM's JSON: data.assets[] {name, value} */
++	_PGS_rsc_exec("SELECT 1 WHERE pg_input_is_valid($2, 'jsonb')", user_id, response);
++	if (SPI_processed == 0)
++	{
++		ereport(WARNING,
++				(errmsg("runtime security: login of user %lld: AM's answer is not valid JSON",
++						(long long) user_id)));
++		_PGS_AmClient_Free(response);
++		return;
++	}
++	n = _PGS_rsc_exec(psprintf("UPDATE %s.user_asset_map k SET asset_key = a.value "
++						  "FROM jsonb_to_recordset("
++						  " CASE WHEN jsonb_typeof($2::jsonb #> '{data,assets}') = 'array'"
++						  " THEN $2::jsonb #> '{data,assets}' ELSE '[]' END)"
++						  " AS a(name text, value text), %s.app_asset s "
++						  "WHERE k.user_id = $1 AND s.app_asset_name = a.name"
++						  " AND k.asset_id = s.app_asset_id"
++						  " AND a.value ~ '" RSC_KEY_PATTERN "'",
++						  q, q), user_id, response);
++	_PGS_AmClient_Free(response);
++
++	ereport(LOG,
++			(errmsg("runtime security: login of user %lld: %llu asset keys stored",
++					(long long) user_id, (unsigned long long) n)));
++}
++
++/* Logout (status 0): remove the user's asset keys */
++static void
++_PGS_rsc_logout(const char *q, int64 user_id)
++{
++	uint64		n;
++
++	n = _PGS_rsc_exec(psprintf("UPDATE %s.user_asset_map SET asset_key = NULL "
++						  "WHERE user_id = $1 AND asset_key IS NOT NULL", q),
++				 user_id, NULL);
++	ereport(LOG,
++			(errmsg("runtime security: logout of user %lld: %llu asset keys removed",
++					(long long) user_id, (unsigned long long) n)));
++}
++
++/* --------------------------------------------------------------- events */
++
++static void
++_PGS_rsc_tenant_created(const char *q, int64 tenant_id)
++{
++	if (_PGS_rsc_exec(psprintf("SELECT json_build_object("
++						  "'tenantId', tenant_id, 'name', tenant_name)::text "
++						  "FROM %s.tenant WHERE tenant_id = $1", q),
++				 tenant_id, NULL) == 0)
++		return;					/* not inserted after all (ON CONFLICT) */
++	_PGS_rsc_queue_send("tenants", tenant_id, _PGS_rsc_value(1));
++}
++
++static void
++_PGS_rsc_user_created(const char *q, int64 user_id)
++{
++	int64		tenant_id;
++
++	if (_PGS_rsc_exec(psprintf("SELECT json_build_object("
++						  "'username', u.user_name, 'role', r.app_role_name,"
++						  " 'displayName', u.user_name)::text, u.tenant_id, u.status "
++						  "FROM %s.tenant_user u"
++						  " LEFT JOIN %s.app_role r ON r.app_role_id = u.role_id "
++						  "WHERE u.user_id = $1", q, q),
++				 user_id, NULL) == 0)
++		return;
++	tenant_id = pg_strtoint64(_PGS_rsc_value(2));
++	_PGS_rsc_queue_send("users", tenant_id, _PGS_rsc_value(1));
++
++	/*
++	 * AM only knows the user after commit, so a user created already active
++	 * gets the map rows now and the keys at the next login.
++	 */
++	if (strcmp(_PGS_rsc_value(3), "1") == 0)
++	{
++		_PGS_rsc_exec(psprintf("INSERT INTO %s.user_asset_map (asset_id, user_id) "
++						  "SELECT m.app_asset_id, u.user_id FROM %s.role_asset_map m"
++						  " JOIN %s.tenant_user u ON u.role_id = m.app_role_id"
++						  " WHERE u.user_id = $1 "
++						  "ON CONFLICT (user_id, asset_id) DO NOTHING",
++						  q, q, q), user_id, NULL);
++		ereport(NOTICE,
++				(errmsg("runtime security: user %lld was created with status 1; asset keys are stored at the next login",
++						(long long) user_id)));
++	}
++}
++
++static void
++_PGS_rsc_user_status(const char *q, int64 user_id)
++{
++	char	   *status;
++	char	   *username;
++	int64		tenant_id;
++
++	if (_PGS_rsc_exec(psprintf("SELECT status, tenant_id, user_name "
++						  "FROM %s.tenant_user WHERE user_id = $1", q),
++				 user_id, NULL) == 0)
++		return;
++	status = _PGS_rsc_value(1);
++	tenant_id = pg_strtoint64(_PGS_rsc_value(2));
++	username = _PGS_rsc_value(3);
++
++	if (strcmp(status, "1") == 0)
++		_PGS_rsc_login(q, user_id, tenant_id, username);
++	else
++		_PGS_rsc_logout(q, user_id);
++}
++
++/*
++ * The role-asset matrix in the shape of AM's role list (GET /api/v1/roles),
++ * with each asset's permissions as 1/0.
++ */
++static void
++_PGS_rsc_matrix_changed(const char *q)
++{
++	_PGS_rsc_exec(psprintf("SELECT json_build_object('roles', coalesce(json_agg("
++					  " json_build_object("
++					  "  'name', r.app_role_name, 'description', NULL,"
++					  "  'assets', coalesce((SELECT json_agg(a.app_asset_name ORDER BY a.app_asset_id)"
++					  "    FROM %s.role_asset_map m JOIN %s.app_asset a ON a.app_asset_id = m.app_asset_id"
++					  "    WHERE m.app_role_id = r.app_role_id), '[]'),"
++					  "  'permissions', coalesce((SELECT json_agg(json_build_object("
++					  "     'asset', a.app_asset_name, 'tableName', a.table_name,"
++					  "     'canCreate', m.can_create::int, 'canRead', m.can_read::int,"
++					  "     'canUpdate', m.can_update::int, 'canDelete', m.can_delete::int,"
++					  "     'canBeOwner', m.can_be_owner::int) ORDER BY a.app_asset_id)"
++					  "    FROM %s.role_asset_map m JOIN %s.app_asset a ON a.app_asset_id = m.app_asset_id"
++					  "    WHERE m.app_role_id = r.app_role_id), '[]'))"
++					  " ORDER BY r.app_role_id), '[]'))::text "
++					  "FROM %s.app_role r",
++					  q, q, q, q, q), 0, NULL);
++	_PGS_rsc_queue_send("roles", 0, _PGS_rsc_value(1));
++}
++
++static void
++_PGS_rsc_process(List *events)
++{
++	ListCell   *lc;
++
++	rsc_busy = true;
++	PG_TRY();
++	{
++		if (SPI_connect() != SPI_OK_CONNECT)
++			elog(ERROR, "runtime security: SPI_connect failed");
++
++		foreach(lc, events)
++		{
++			RscEvent   *ev = (RscEvent *) lfirst(lc);
++			const char *q = quote_identifier(ev->schema);
++
++			switch (ev->kind)
++			{
++				case RSC_TENANT_CREATED:
++					_PGS_rsc_tenant_created(q, ev->id);
++					break;
++				case RSC_USER_CREATED:
++					_PGS_rsc_user_created(q, ev->id);
++					break;
++				case RSC_USER_STATUS:
++					_PGS_rsc_user_status(q, ev->id);
++					break;
++				case RSC_MATRIX_CHANGED:
++					_PGS_rsc_matrix_changed(q);
++					break;
++			}
++		}
++
++		SPI_finish();
++	}
++	PG_FINALLY();
++	{
++		rsc_busy = false;
++	}
++	PG_END_TRY();
++}
++
++/*
++ * Called by standard_ExecutorFinish(): handle the rows this statement
++ * caught.
++ */
++void
++_PGS_RuntimeSecurity_StatementEnd(EState *estate)
++{
++	List	   *mine = NIL;
++	List	   *rest = NIL;
++	ListCell   *lc;
++	MemoryContext oldcxt;
++
++	if (pending_events == NIL || rsc_busy)
++		return;
++
++	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	foreach(lc, pending_events)
++	{
++		RscEvent   *ev = (RscEvent *) lfirst(lc);
++
++		if (ev->estate == estate)
++			mine = lappend(mine, ev);
++		else
++			rest = lappend(rest, ev);
++	}
++	MemoryContextSwitchTo(oldcxt);
++
++	if (mine == NIL)
++		return;
++	pending_events = rest;
++	_PGS_rsc_process(mine);
++}
++
++/* ------------------------------------------------------------- commit */
++
++static void
++_PGS_rsc_send_all(void)
++{
++	ListCell   *lc;
++
++	foreach(lc, pending_sends)
++	{
++		RscSend    *s = (RscSend *) lfirst(lc);
++		char	   *response = NULL;
++		char		errbuf[256];
++		int			status;
++
++		status = _PGS_AmClient_Call(s->endpoint, NULL, s->tenant_id, s->body,
++							   &response, errbuf, sizeof(errbuf));
++		if (status == 0)
++			ereport(LOG,
++					(errmsg("runtime security: AM is not configured (am_client.conf); %s payload written to am_outbox.jsonl",
++							s->endpoint)));
++		else if (status < 0)
++			ereport(WARNING,
++					(errmsg("runtime security: could not send %s to AM: %s",
++							s->endpoint, errbuf)));
++		else if (status >= 200 && status < 300)
++			ereport(LOG,
++					(errmsg("runtime security: sent %s to AM (HTTP %d)",
++							s->endpoint, status)));
++		else
++			ereport(WARNING,
++					(errmsg("runtime security: AM refused %s (HTTP %d): %.300s",
++							s->endpoint, status, response ? response : "")));
++		_PGS_AmClient_Free(response);
++	}
++}
++
++static void
++_PGS_rsc_xact_callback(XactEvent event, void *arg)
++{
++	switch (event)
++	{
++		case XACT_EVENT_PRE_COMMIT:
++			/* Rows whose statement did not reach ExecutorFinish */
++			if (pending_events != NIL)
++			{
++				List	   *events = pending_events;
++
++				pending_events = NIL;
++				_PGS_rsc_process(events);
++			}
++			break;
++		case XACT_EVENT_COMMIT:
++			_PGS_rsc_send_all();
++			pending_events = NIL;
++			pending_sends = NIL;
++			break;
++		case XACT_EVENT_PREPARE:
++			if (pending_sends != NIL)
++				ereport(WARNING,
++						(errmsg("runtime security: nothing is sent to AM for a prepared transaction")));
++			pending_events = NIL;
++			pending_sends = NIL;
++			break;
++		case XACT_EVENT_ABORT:
++		case XACT_EVENT_PARALLEL_ABORT:
++			pending_events = NIL;
++			pending_sends = NIL;
++			rsc_busy = false;
++			break;
++		default:
++			break;
++	}
++}
++
++/*
++ * A rolled-back savepoint forgets what it caught; a released one hands it
++ * to its parent.
++ */
++static void
++_PGS_rsc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
++					 SubTransactionId parentSubid, void *arg)
++{
++	int			level = GetCurrentTransactionNestLevel();
++	List	   *events = NIL;
++	List	   *sends = NIL;
++	ListCell   *lc;
++	MemoryContext oldcxt;
++
++	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
++		return;
++
++	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
++	foreach(lc, pending_events)
++	{
++		RscEvent   *ev = (RscEvent *) lfirst(lc);
++
++		if (ev->nestlevel < level)
++			events = lappend(events, ev);
++		else if (event == SUBXACT_EVENT_COMMIT_SUB)
++		{
++			ev->nestlevel = level - 1;
++			events = lappend(events, ev);
++		}
++	}
++	foreach(lc, pending_sends)
++	{
++		RscSend    *s = (RscSend *) lfirst(lc);
++
++		if (s->nestlevel < level)
++			sends = lappend(sends, s);
++		else if (event == SUBXACT_EVENT_COMMIT_SUB)
++		{
++			s->nestlevel = level - 1;
++			sends = lappend(sends, s);
++		}
++	}
++	MemoryContextSwitchTo(oldcxt);
++
++	pending_events = events;
++	pending_sends = sends;
++	if (event == SUBXACT_EVENT_ABORT_SUB)
++		rsc_busy = false;
++}
+diff --git a/src/include/commands/discreet_metadata.h b/src/include/commands/discreet_metadata.h
+new file mode 100644
+index 00000000000..5926024696e
+--- /dev/null
++++ b/src/include/commands/discreet_metadata.h
+@@ -0,0 +1,22 @@
++/*-------------------------------------------------------------------------
++ *
++ * discreet_metadata.h
++ *	  Discreet metadata service: asset records for columns marked for
++ *	  encryption in their comment.
++ *
++ * DefineRelation() (CREATE TABLE), CommentObject() (COMMENT ON) and
++ * heap_drop_with_catalog() (DROP TABLE) only call _PGS_Discreet_Metadata_Track();
++ * all the code lives in
++ * src/backend/commands/discreet_metadata.c.
++ *
++ * src/include/commands/discreet_metadata.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef DISCREET_METADATA_H
++#define DISCREET_METADATA_H
++
++/* Remember a table; its asset records are written to metadata.json at commit */
++extern void _PGS_Discreet_Metadata_Track(Oid relid);
++
++#endif							/* DISCREET_METADATA_H */
+diff --git a/src/include/executor/am_client.h b/src/include/executor/am_client.h
+new file mode 100644
+index 00000000000..52d56333a72
+--- /dev/null
++++ b/src/include/executor/am_client.h
+@@ -0,0 +1,50 @@
++/*-------------------------------------------------------------------------
++ *
++ * am_client.h
++ *	  C entry points of the Asset Access Service (AM) client
++ *	  (src/backend/executor/am_client.cpp).
++ *
++ * The client reads am_client.conf in the data directory on every call, so
++ * it can be changed without a restart.  Every call is also written to
++ * am_outbox.jsonl there (method, path, tenant and the request body; never
++ * the API key or the response).  See am_client.cpp for the settings.
++ *
++ * src/include/executor/am_client.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef AM_CLIENT_H
++#define AM_CLIENT_H
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++
++/*
++ * Call one AM endpoint:
++ *
++ *	"tenants"      POST  a tenant          (body: {"slug", "name"}; admin API)
++ *	"users"        POST  a user            (body: {"username", "role", "displayName"})
++ *	"roles"        POST  the role-asset matrix ({"ROLE": ["A01", ...]}; admin API)
++ *	"user_assets"  GET   a user's assets and values (username in the path)
++ *
++ * tenant_id picks the API key (api_key.<tenant_id>, else api_key); 0 uses
++ * the default key.  body may be NULL.  If response is not NULL it receives
++ * the response body (free it with _PGS_AmClient_Free).
++ *
++ * Returns the HTTP status, 0 if AM is not configured (no url: the call is
++ * only written to the outbox), or -1 on a connection error (errbuf says
++ * why).
++ */
++extern int	_PGS_AmClient_Call(const char *endpoint, const char *username,
++						  long long tenant_id, const char *body,
++						  char **response, char *errbuf, int errbuflen);
++
++extern void _PGS_AmClient_Free(char *response);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif							/* AM_CLIENT_H */
+diff --git a/src/include/executor/cpp_logger.h b/src/include/executor/cpp_logger.h
+new file mode 100644
+index 00000000000..77d1a200b5f
+--- /dev/null
++++ b/src/include/executor/cpp_logger.h
+@@ -0,0 +1,15 @@
++/*-------------------------------------------------------------------------
++ *
++ * cpp_logger.h
++ *	  C entry point of the C++ logger (src/backend/executor/cpp_logger.cpp)
++ *
++ * src/include/executor/cpp_logger.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef CPP_LOGGER_H
++#define CPP_LOGGER_H
++
++extern void _PGS_myCppFunction(int value);
++
++#endif							/* CPP_LOGGER_H */
+diff --git a/src/include/executor/discreet_hooks.h b/src/include/executor/discreet_hooks.h
+new file mode 100644
+index 00000000000..82c57cfce90
+--- /dev/null
++++ b/src/include/executor/discreet_hooks.h
+@@ -0,0 +1,57 @@
++/*-------------------------------------------------------------------------
++ *
++ * discreet_hooks.h
++ *	  Discreet R1/W1 executor instrumentation hooks.
++ *
++ * The executor calls these at two points (see the design brief
++ * Discreet_PostgreSQL_R1_W1_Design_Rationale_With_Test_Cases):
++ *
++ *	R1  ExecutePlan()      each result row, before it is sent to the client
++ *	W1  ExecInsert/ExecUpdate/ExecDelete()  each row before it is written
++ *
++ * plus the logger hook _PGS_LogExecutorTableInfo().  All the code lives in
++ * src/backend/executor/discreet_hooks.c; execMain.c and nodeModifyTable.c
++ * only contain the calls.
++ *
++ * src/include/executor/discreet_hooks.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef DISCREET_HOOKS_H
++#define DISCREET_HOOKS_H
++
++#include "executor/execdesc.h"
++#include "nodes/execnodes.h"
++#include "executor/tuptable.h"
++#include "storage/itemptr.h"
++#include "utils/relcache.h"
++
++/* Logger hook: action, table, PID and thread ID */
++extern void _PGS_LogExecutorTableInfo(const char *action, Oid table_oid, const char *relname);
++
++/* Logger hook for ExecutorRun: one line per table the plan uses */
++extern void _PGS_Discreet_LogExecutorRun(QueryDesc *queryDesc);
++
++/* R1: a result row about to be sent (TC-01..04, 07..10, 12) */
++extern void _PGS_Discreet_R1_Intercept(QueryDesc *queryDesc, TupleTableSlot *slot, uint64 row_num);
++
++/* W1: a row about to be written (TC-05, TC-06, TC-11) */
++extern void _PGS_Discreet_W1_Insert(Relation rel, TupleTableSlot *slot, const char *stage);
++extern void _PGS_Discreet_W1_Update(Relation rel, TupleTableSlot *slot, ItemPointer tupleid);
++extern void _PGS_Discreet_W1_Delete(Relation rel, ItemPointer tupleid);
++
++/*
++ * Integer shift: user tables store integer columns +10 (W1) and the client
++ * gets them back -10 (R1), so it sees what it wrote while the table and the
++ * logs hold the shifted value.  SET discreet.shift_integers = off disables it.
++ */
++extern void _PGS_Discreet_W1_ShiftInsert(ModifyTableState *mtstate, ResultRelInfo *resultRelInfo,
++									TupleTableSlot *slot);
++extern void _PGS_Discreet_W1_ShiftUpdate(ResultRelInfo *resultRelInfo, EState *estate,
++									TupleTableSlot *slot);
++extern void _PGS_Discreet_R1_Unshift(QueryDesc *queryDesc, TupleTableSlot *slot, uint64 row_num);
++
++/* Planner: rewrite a client query so WHERE, expressions and SET use original values */
++extern void _PGS_Discreet_PlannerRewrite(Query *parse);
++
++#endif							/* DISCREET_HOOKS_H */
+diff --git a/src/include/executor/runtime_security.h b/src/include/executor/runtime_security.h
+new file mode 100644
+index 00000000000..9faf84d0869
+--- /dev/null
++++ b/src/include/executor/runtime_security.h
+@@ -0,0 +1,43 @@
++/*-------------------------------------------------------------------------
++ *
++ * runtime_security.h
++ *	  Runtime security check: executor hooks on the Secure-ERMS tenant,
++ *	  user account and role / protected-type tables.  The code lives in the two executor files:
++ *
++ *	nodeModifyTable.c  ExecModifyTable(): each row written is caught
++ *	                   (_PGS_RuntimeSecurity_CaptureRow) and handed to execMain.c
++ *	execMain.c         standard_ExecutorFinish(): the caught rows are handled
++ *	                   (SPI, login / logout, JSON), and sent to AM at commit
++ *
++ * This header is only what the two files share.
++ *
++ * src/include/executor/runtime_security.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef RUNTIME_SECURITY_H
++#define RUNTIME_SECURITY_H
++
++#include "nodes/execnodes.h"
++#include "utils/relcache.h"
++
++/* What a caught row means */
++typedef enum RscEventKind
++{
++	RSC_TENANT_CREATED,			/* INSERT INTO tenants (id = tenant_id) */
++	RSC_USER_CREATED,			/* INSERT INTO user_accounts (id = user_id) */
++	RSC_USER_STATUS,			/* UPDATE user_accounts SET login_status or
++								 * status (login / logout / disabled) */
++	RSC_MATRIX_CHANGED,			/* any write to roles, protected_type_catalog,
++								 * role_protected_type_permissions */
++	RSC_TENANT_STATUS,			/* UPDATE tenants SET status (disabled) */
++} RscEventKind;
++
++/*
++ * execMain.c: remember a row caught by nodeModifyTable.c until the end of
++ * its statement.
++ */
++extern void _PGS_RuntimeSecurity_AddEvent(RscEventKind kind, EState *estate,
++									 Relation rel, int64 id);
++
++#endif							/* RUNTIME_SECURITY_H */

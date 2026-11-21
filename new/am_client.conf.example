@@ -1,0 +1,47 @@
+# Settings of the AM client inside PostgreSQL (am_client.cpp).
+# Copy to D:\postgres-dev\data\am_client.conf and fill in.  Read on every
+# call, so no restart is needed.  Keep this file private: it holds API keys
+# and the AM admin's password.
+
+# AM's address.  Leave empty to send nothing (calls are still written to
+# am_outbox.jsonl in the data directory).
+url = http://127.0.0.1:8080
+
+timeout_ms = 5000
+
+# --- The real AM (asset-access-service.jar) ---------------------------------
+# The matrix and new tenants go to its admin API as its platform admin.
+# Leave admin_user out for the mock (mock_am.py), which takes them with the
+# API key.
+admin_user = admin
+admin_password = replace-me
+
+# First admin of each tenant PostgreSQL creates in AM (AM requires one).
+tenant_admin_user = manager
+tenant_admin_password = replace-me-too
+
+# AM requires a password for every user; PostgreSQL sends a random one that
+# nobody knows (logins fetch the assets with the tenant's API key).
+user_password = random
+
+# X-Api-Key: one key per tenant (api_key.<TenantID>), made in AM's console
+# (merged\setup_merged_jar.ps1 does it), api_key for the rest.
+# api_key.1001 = ak_...
+# api_key = ak_...
+
+# --- Keys endpoint inside PostgreSQL (am_keys) ------------------------------
+# Needs shared_preload_libraries = 'am_keys' in postgresql.conf.
+# Same value as "push_secret" in login-server\config.json.
+push_secret = change-this-shared-secret
+keys_port = 7001
+keys_database = erms
+keys_wait_seconds = 10
+
+# Paths (defaults shown; with admin_user set, tenants and roles default to
+# /api/admin/tenants and /api/admin/role-asset-map).
+# path.tenants = /api/v1/tenants
+# path.users = /api/v1/users
+# path.roles = /api/v1/roles
+# path.user_assets = /api/v1/users/{username}/assets
+# path.admin_token = /api/admin/auth/token
+# path.admin_logout = /api/admin/auth/logout

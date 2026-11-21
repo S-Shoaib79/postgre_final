@@ -1,0 +1,33 @@
+# Asset Access Service: local settings.
+#
+# The service reads this file automatically when it is started from the bundle folder
+# (the folder that contains asset-access-service.jar and this config/ folder).
+# Change the values marked CHANGE before the first start.
+
+spring:
+  datasource:
+    # The database created by sql/create_database.sql.
+    url: jdbc:postgresql://localhost:5432/asset_access
+    username: asset_access
+    password: CHANGE-to-the-password-you-gave-asset_access
+
+app:
+  bootstrap:
+    # The platform admin created on the first start (only while none exists).
+    # Later changes here have no effect; change the password in the console instead.
+    admin-username: admin
+    admin-password: CHANGE-to-a-platform-admin-password
+
+  asset-delivery:
+    # Where a successful login sends the user's assets and values. For the ERMS flow this is
+    # PostgreSQL's keys endpoint (am_keys, keys_port in data/am_client.conf). Logins fail with
+    # 502 ASSET_DELIVERY_FAILED while nothing answers here.
+    # (For the jar's own smoke test with scripts/test-receiver: http://localhost:9090/assets)
+    url: http://127.0.0.1:7001/api/am/keys
+    # Sent in the X-Asset-Delivery-Secret header. Must be the same value as push_secret in
+    # data/am_client.conf (and login-server/config.json).
+    secret: CHANGE-to-a-long-random-shared-secret
+
+server:
+  # The service's address will be http://localhost:8080/
+  port: 8080

@@ -1,0 +1,6 @@
+{
+  "Role 1": ["Asset 1", "Asset 3", "Asset 6"],
+  "Role 2": ["Asset 1", "Asset 2", "Asset 6"],
+  "Role 3": ["Asset 3", "Asset 4", "Asset 5"],
+  "Role 4": ["Asset 2", "Asset 3", "Asset 5"]
+}

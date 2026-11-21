@@ -1,0 +1,19 @@
+{
+  "port": 7000,
+  "am_url": "",
+  "am_login_path": "/api/v1/auth/login",
+  "am_timeout_seconds": 5,
+  "am_client_conf": "D:\\postgres-dev\\data\\am_client.conf",
+  "push_secret": "change-this-shared-secret",
+  "token_lifetime_seconds": 3600,
+  "refresh_token_lifetime_seconds": 28800,
+  "clients": ["erms_web"],
+  "scopes": ["read", "write"],
+  "sweep_seconds": 30,
+  "psql": "D:\\postgres-dev\\install\\bin\\psql.exe",
+  "db_host": "localhost",
+  "db_port": 5432,
+  "db_name": "erms",
+  "db_user": "postgres",
+  "db_password": ""
+}

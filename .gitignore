@@ -1,0 +1,12 @@
+# Local only: build output, installed binaries, the cluster
+# (holds am_client.conf with passwords, API keys and push_secret)
+/build/
+/install/
+/data/
+
+# Secrets and run output
+login-server/config.json
+*.jar
+*.log
+am_outbox.jsonl
+__pycache__/
