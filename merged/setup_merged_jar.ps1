@@ -106,7 +106,7 @@ Write-Host "4. 03_tenant_data.sql, the rest (users -> jar with their tenant's ke
 Invoke-Psql @('-d', 'erms') (($lines[($end + 1)..($lines.Count - 1)]) -join "`n")
 
 Write-Host "4b. 05_oauth.sql (oauth_tokens and the session functions for the login app)"
-Invoke-Psql @('-d', 'erms', '-f', "$Here_oauth.sql")
+Invoke-Psql @('-d', 'erms', '-f', "$Here\05_oauth.sql")
 
 # PostgreSQL registers each user in the jar with a random password nobody knows
 # (user_password = random). For the login flow, give every test user a known one:
