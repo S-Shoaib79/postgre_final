@@ -57,4 +57,19 @@ CREATE TABLE user_asset_map (
 );
 CREATE INDEX ix_user_asset_map_tenant ON user_asset_map (tenant_id);
 
+-- The protected columns (protected_type_catalog: A01-A04) hold ciphertext.
+-- When AM pushes a user's asset keys (am_keys), each value of that tenant is
+-- encrypted with the tenant's key for its type: AES-256-CBC, random 16-byte
+-- IV, stored as base64(IV || ciphertext). Values of up to 31 bytes fit in
+-- VARCHAR(64). The salary check cannot apply to ciphertext.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+ALTER TABLE compensation DROP CONSTRAINT ck_compensation_nonnegative;
+ALTER TABLE employees
+  ALTER COLUMN date_of_birth TYPE VARCHAR(64) USING to_char(date_of_birth, 'YYYY-MM-DD'),
+  ALTER COLUMN ssn           TYPE VARCHAR(64);
+ALTER TABLE compensation
+  ALTER COLUMN base_salary   TYPE VARCHAR(64) USING base_salary::text;
+ALTER TABLE bank_accounts
+  ALTER COLUMN account_number TYPE VARCHAR(64);
+
 COMMIT;

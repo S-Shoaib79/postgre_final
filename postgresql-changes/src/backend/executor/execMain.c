@@ -73,6 +73,10 @@
 #include "executor/spi.h"
 #include "utils/memutils.h"
 #include "executor/runtime_security.h"
+#include "catalog/pg_authid.h"
+#include "common/base64.h"
+#include "utils/datum.h"
+#include <openssl/evp.h>
 
 /* Runtime security: defined at the end of this file */
 static void _PGS_RuntimeSecurity_StatementEnd(EState *estate);
@@ -1790,6 +1794,260 @@ _PGS_Discreet_GetScanTypeFromTag(NodeTag tag)
 	}
 }
 
+/* ----------------------------------------------------------------
+ *		ERMS: decrypt the protected columns on read
+ *
+ * am_keys stores each value of a protected column (protected_type_catalog,
+ * A01-A04) as base64(IV || AES-256-CBC ciphertext) under the tenant's key
+ * for its type.  When a result row leaves for the client, every output
+ * column that comes straight from such a column and holds ciphertext is
+ * decrypted with a key from user_asset_map (so only while a user of that
+ * tenant with that type is signed in), and the log shows the encrypted and
+ * the decrypted value.  With erms.tenant_id set only that tenant's keys are
+ * tried.  Without a key the client gets the ciphertext.  Keys are never
+ * logged.  SQL inside the server (SPI) reads the stored ciphertext.
+ * ----------------------------------------------------------------
+ */
+
+/* base64 of 32 or 48 bytes, the form am_keys writes (44 or 64 characters) */
+static bool
+_PGS_Erms_LooksEncrypted(const char *s)
+{
+	size_t		len = strlen(s);
+
+	if (len == 44 && s[43] == '=')
+		len = 43;
+	else if (len != 64)
+		return false;
+	for (size_t i = 0; i < len; i++)
+		if (!isalnum((unsigned char) s[i]) && s[i] != '+' && s[i] != '/')
+			return false;
+	return true;
+}
+
+/* The plaintext, or NULL if this key does not open it (padding, or not text) */
+static char *
+_PGS_Erms_DecryptWith(const char *ct_b64, const char *key_b64)
+{
+	uint8		ct[64];
+	uint8		key[64];
+	uint8		out[64 + 16];
+	int			ctlen;
+	int			keylen;
+	int			n1 = 0;
+	int			n2 = 0;
+	bool		ok;
+	char	   *result = NULL;
+	EVP_CIPHER_CTX *ctx;
+
+	ctlen = pg_b64_decode(ct_b64, (int) strlen(ct_b64), ct, sizeof(ct));
+	keylen = pg_b64_decode(key_b64, (int) strlen(key_b64), key, sizeof(key));
+	if (ctlen < 32 || ctlen % 16 != 0 || keylen != 32)
+	{
+		explicit_bzero(key, sizeof(key));
+		return NULL;
+	}
+	ctx = EVP_CIPHER_CTX_new();
+	ok = ctx != NULL &&
+		EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, ct) == 1 &&
+		EVP_DecryptUpdate(ctx, out, &n1, ct + 16, ctlen - 16) == 1 &&
+		EVP_DecryptFinal_ex(ctx, out + n1, &n2) == 1;
+	if (ctx != NULL)
+		EVP_CIPHER_CTX_free(ctx);
+	explicit_bzero(key, sizeof(key));
+	if (ok)
+	{
+		ok = pg_verifymbstr((const char *) out, n1 + n2, true);
+		for (int i = 0; ok && i < n1 + n2; i++)
+			ok = out[i] >= 0x20 && out[i] != 0x7f;
+	}
+	if (ok)
+		result = pnstrdup((const char *) out, n1 + n2);
+	explicit_bzero(out, sizeof(out));
+	return result;
+}
+
+/*
+ * The keys that may open a value of relid.attno: *type_id is set if the
+ * column is a protected one, and the list holds the asset keys (base64) of
+ * that type in user_asset_map, of the erms.tenant_id tenant if it is set.
+ * Read as the bootstrap superuser: the reading role has no access to
+ * user_asset_map.
+ */
+static List *
+_PGS_Erms_KeysFor(Oid relid, AttrNumber attno, char **type_id)
+{
+	Oid			nsp = get_rel_namespace(relid);
+	char	   *relname = get_rel_name(relid);
+	char	   *attname = get_attname(relid, attno, true);
+	const char *tenant = GetConfigOption("erms.tenant_id", true, false);
+	MemoryContext caller = CurrentMemoryContext;
+	Oid			argtypes[3] = {TEXTOID, TEXTOID, TEXTOID};
+	Datum		values[3];
+	Oid			save_userid;
+	int			save_sec;
+	List	   *volatile keys = NIL;
+	char	   *nspname;
+	char	   *sql;
+
+	*type_id = NULL;
+	if (relname == NULL || attname == NULL ||
+		!OidIsValid(get_relname_relid("user_asset_map", nsp)) ||
+		!OidIsValid(get_relname_relid("protected_type_catalog", nsp)))
+		return NIL;
+
+	nspname = (char *) quote_identifier(get_namespace_name(nsp));
+	sql = psprintf("SELECT c.type_id, k.asset_key FROM %s.protected_type_catalog c"
+				   " LEFT JOIN %s.user_asset_map k ON k.type_id = c.type_id"
+				   "  AND k.asset_key IS NOT NULL"
+				   "  AND ($3 = '' OR k.tenant_id::text = $3)"
+				   " WHERE c.table_name = $1 AND c.column_name = $2",
+				   nspname, nspname);
+	values[0] = CStringGetTextDatum(relname);
+	values[1] = CStringGetTextDatum(attname);
+	values[2] = CStringGetTextDatum(tenant != NULL ? tenant : "");
+
+	GetUserIdAndSecContext(&save_userid, &save_sec);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
+						   save_sec | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		SPI_connect();
+		SPI_execute_with_args(sql, 3, argtypes, values, NULL, true, 0);
+		for (uint64 r = 0; r < SPI_processed; r++)
+		{
+			char	   *t = SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1);
+			char	   *k = SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2);
+			MemoryContext spicxt = MemoryContextSwitchTo(caller);
+
+			if (*type_id == NULL)
+				*type_id = pstrdup(t);
+			if (k != NULL)
+				keys = lappend(keys, pstrdup(k));
+			MemoryContextSwitchTo(spicxt);
+		}
+		SPI_finish();
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(save_userid, save_sec);
+	}
+	PG_END_TRY();
+	return keys;
+}
+
+/*
+ * Called for each row ExecutePlan sends.  Replaces the protected ciphertext
+ * columns with their plaintext and logs both.
+ */
+static void
+_PGS_Erms_DecryptRow(QueryDesc *queryDesc, TupleTableSlot *slot, uint64 row_num)
+{
+	PlannedStmt *stmt = queryDesc != NULL ? queryDesc->plannedstmt : NULL;
+	TupleDesc	tupdesc = slot->tts_tupleDescriptor;
+	int			natts = tupdesc->natts;
+	MemoryContext oldcxt;
+	Datum	   *values;
+	StringInfoData buf;
+	int			ndecrypted = 0;
+	ListCell   *lc;
+
+	if (stmt == NULL || stmt->planTree == NULL || queryDesc->dest == NULL ||
+		queryDesc->estate == NULL || _PGS_SPI_is_connected())
+		return;
+
+	/* Only rows leaving for the client (as in _PGS_Discreet_R1_Unshift) */
+	switch (queryDesc->dest->mydest)
+	{
+		case DestRemote:
+		case DestRemoteExecute:
+		case DestRemoteSimple:
+		case DestCopyOut:
+		case DestTuplestore:
+		case DestSQLFunction:
+			break;
+		default:
+			return;
+	}
+
+	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(queryDesc->estate));
+	slot_getallattrs(slot);
+	values = palloc_array(Datum, natts);
+	memcpy(values, slot->tts_values, sizeof(*values) * natts);
+	initStringInfo(&buf);
+
+	foreach(lc, stmt->planTree->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		int			i = tle->resno - 1;
+		Form_pg_attribute attr;
+		char	   *stored;
+		char	   *type_id;
+		char	   *plain = NULL;
+		List	   *keys;
+		ListCell   *kc;
+
+		if (tle->resjunk || i < 0 || i >= natts || slot->tts_isnull[i] ||
+			!OidIsValid(tle->resorigtbl) || tle->resorigcol <= 0)
+			continue;
+		attr = TupleDescAttr(tupdesc, i);
+		if (attr->atttypid != VARCHAROID && attr->atttypid != TEXTOID)
+			continue;
+		stored = TextDatumGetCString(values[i]);
+		if (!_PGS_Erms_LooksEncrypted(stored))
+			continue;
+		keys = _PGS_Erms_KeysFor(tle->resorigtbl, tle->resorigcol, &type_id);
+		if (type_id == NULL)
+			continue;			/* not a protected column */
+
+		foreach(kc, keys)
+		{
+			plain = _PGS_Erms_DecryptWith(stored, (char *) lfirst(kc));
+			if (plain != NULL)
+				break;
+		}
+		foreach(kc, keys)
+			explicit_bzero(lfirst(kc), strlen((char *) lfirst(kc)));
+
+		if (plain != NULL)
+		{
+			appendStringInfo(&buf, " | %s.%s (%s): encrypted %s -> decrypted %s",
+							 get_rel_name(tle->resorigtbl), NameStr(attr->attname),
+							 type_id, stored, plain);
+			values[i] = CStringGetTextDatum(plain);
+			ndecrypted++;
+		}
+		else
+			appendStringInfo(&buf, " | %s.%s (%s): encrypted %s -> not decrypted (no key: no signed-in user of this tenant has %s)",
+							 get_rel_name(tle->resorigtbl), NameStr(attr->attname),
+							 type_id, stored, type_id);
+	}
+
+	if (ndecrypted > 0)
+	{
+		bool	   *nulls = palloc_array(bool, natts);
+
+		/* Store the row as a new virtual tuple, as _PGS_Discreet_R1_Unshift does */
+		memcpy(nulls, slot->tts_isnull, sizeof(*nulls) * natts);
+		for (int i = 0; i < natts; i++)
+		{
+			CompactAttribute *cattr = TupleDescCompactAttr(tupdesc, i);
+
+			if (!nulls[i] && !cattr->attbyval)
+				values[i] = datumCopy(values[i], cattr->attbyval, cattr->attlen);
+		}
+		ExecClearTuple(slot);
+		memcpy(slot->tts_values, values, sizeof(*values) * natts);
+		memcpy(slot->tts_isnull, nulls, sizeof(*nulls) * natts);
+		ExecStoreVirtualTuple(slot);
+		ExecMaterializeSlot(slot);
+	}
+	if (buf.len > 0)
+		elog(LOG, "[ERMS_DECRYPT] READ row %llu%s", (unsigned long long) row_num, buf.data);
+
+	MemoryContextSwitchTo(oldcxt);
+}
+
 /* 3. Main Interception Function */
 
 static void
@@ -2048,6 +2306,10 @@ ExecutePlan(QueryDesc *queryDesc,
 				_PGS_myCppFunction((int) (current_tuple_count + 1));
 			}
 			*/
+
+			/* ERMS: decrypt the protected columns (A01-A04) for the client, log both values */
+			if (slot && !TupIsNull(slot))
+				_PGS_Erms_DecryptRow(queryDesc, slot, current_tuple_count + 1);
 
 			/* Discreet R1: return integer columns -10, as the client wrote them */
 			/* Disabled (integer shift off): _PGS_Discreet_R1_Unshift(queryDesc, slot, current_tuple_count + 1); */
@@ -3764,7 +4026,7 @@ _PGS_rsc_login(const char *q, int64 user_id, int64 tenant_id, const char *userna
 	uint64		bad;
 
 	/* Types the role no longer grants */
-	_PGS_rsc_exec(psprintf("DELETE FROM %s.user_asset_map k "
+	_PGS_rsc_exec(psprintf("DELETE FROM %s.user_asset_map k "               // login_status = 1 (Login): Creates rows in user_asset_map for role types & nulls old keys
 					  "WHERE k.user_id = $1 AND k.type_id NOT IN ("
 					  "SELECT t.type_id FROM (" RSC_USER_TYPES ") t)",
 					  q, q, q, q, q), user_id, NULL);
@@ -3837,7 +4099,7 @@ _PGS_rsc_login(const char *q, int64 user_id, int64 tenant_id, const char *userna
 
 /* Logout (login_status 0, or the account is no longer ACTIVE): remove keys */
 static void
-_PGS_rsc_logout(const char *q, int64 user_id)
+_PGS_rsc_logout(const char *q, int64 user_id)    //ppp  Immediately clears and wipes all asset keys to NULL
 {
 	uint64		n;
 

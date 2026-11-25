@@ -102,10 +102,10 @@ static const char *const amk_store_sql =
 " u AS (SELECT ua.user_id FROM public.user_accounts ua, req"
 "   WHERE ua.username = req.j ->> 'username' AND ua.login_status = 1"
 "   AND (req.j ->> 'tenantId' IS NULL OR ua.tenant_id::text = req.j ->> 'tenantId')"
-"   AND EXISTS (SELECT 1 FROM public.oauth_tokens t"
+"   AND EXISTS (SELECT 1 FROM public.oauth_tokens t"                //pp validating login id against a live session
 "     WHERE t.token_id = req.j ->> 'loginId' AND t.user_id = ua.user_id"
 "     AND t.revoked_at IS NULL AND t.session_expires_at > now())),"
-" s AS (UPDATE public.user_asset_map k SET asset_key = a.value"
+" s AS (UPDATE public.user_asset_map k SET asset_key = a.value"      //pp Writes keys into user_asset_map
 "   FROM u, req, jsonb_to_recordset(req.j -> 'assets') AS a(name text, value text)"
 "   WHERE (SELECT count(*) FROM u) = 1 AND k.user_id = u.user_id AND k.type_id = a.name"
 "   RETURNING k.type_id)"
@@ -119,8 +119,74 @@ static const char *const amk_store_sql =
 "        FROM jsonb_array_elements(req.j -> 'assets') e"
 "        WHERE e ->> 'name' NOT IN (SELECT type_id FROM s))))::text,"
 "  (SELECT coalesce(string_agg(type_id, ',' ORDER BY type_id), '') FROM s),"
-"  req.j ->> 'username', coalesce(req.j ->> 'loginId', '')"
+"  req.j ->> 'username', coalesce(req.j ->> 'loginId', ''),"
+"  (SELECT min(user_id) FROM u)::text"
 " FROM req";
+
+/*
+ * After the keys are stored: the table and column of each stored type
+ * (protected_type_catalog), the user's tenant and the key.
+ */
+static const char *const amk_targets_sql =
+"SELECT c.table_name, c.column_name, k.tenant_id::text, k.asset_key"
+" FROM public.user_asset_map k"
+" JOIN public.protected_type_catalog c ON c.type_id = k.type_id"
+" WHERE k.user_id = $1::bigint AND k.asset_key IS NOT NULL"
+"   AND k.type_id = ANY (string_to_array($2, ','))"
+" ORDER BY k.type_id";
+
+/*
+ * Encrypts every plaintext value of the column for the tenant with the key:
+ * AES-256-CBC (pgcrypto), a random 16-byte IV per value, stored as
+ * base64(IV || ciphertext) -- 44 characters for up to 15 bytes, 64 for up to
+ * 31, so it fits VARCHAR(64).  A value already in that form is ciphertext
+ * and is left alone; a longer value would not fit and is left alone too.
+ * %1$s = table, %2$s = column (both quoted).
+ */
+static const char *const amk_encrypt_sql =
+"UPDATE public.%1$s t SET %2$s = ("
+"   SELECT encode(r.iv || public.encrypt_iv(convert_to(t.%2$s::text, 'UTF8'),"
+"     decode($1, 'base64'), r.iv, 'aes-cbc/pad:pkcs'), 'base64')"
+"   FROM (SELECT public.gen_random_bytes(16) AS iv) r)"
+" WHERE t.tenant_id = $2::bigint AND t.%2$s IS NOT NULL"
+"   AND octet_length(t.%2$s::text) <= 31"
+"   AND t.%2$s::text !~ '^[A-Za-z0-9+/]{43}=$'"
+"   AND t.%2$s::text !~ '^[A-Za-z0-9+/]{64}$'";
+
+/* Encrypts the tenant's data of each type just stored for the user. */
+static void
+amk_encrypt_data(const char *user_id, const char *stored)
+{
+	Oid			argtypes[2] = {TEXTOID, TEXTOID};
+	Datum		values[2];
+	SPITupleTable *targets;
+	uint64		ntargets;
+
+	if (stored[0] == '\0')
+		return;
+	values[0] = CStringGetTextDatum(user_id);
+	values[1] = CStringGetTextDatum(stored);
+	/* not read-only: it must see the keys amk_store_sql has just written */
+	SPI_execute_with_args(amk_targets_sql, 2, argtypes, values, NULL, false, 0);
+	targets = SPI_tuptable;
+	ntargets = SPI_processed;
+
+	for (uint64 i = 0; i < ntargets; i++)
+	{
+		char	   *table = SPI_getvalue(targets->vals[i], targets->tupdesc, 1);
+		char	   *column = SPI_getvalue(targets->vals[i], targets->tupdesc, 2);
+		char	   *tenant = SPI_getvalue(targets->vals[i], targets->tupdesc, 3);
+		char	   *key = SPI_getvalue(targets->vals[i], targets->tupdesc, 4);
+		char	   *sql = psprintf(amk_encrypt_sql, quote_identifier(table), quote_identifier(column));
+
+		values[0] = CStringGetTextDatum(key);
+		values[1] = CStringGetTextDatum(tenant);
+		SPI_execute_with_args(sql, 2, argtypes, values, NULL, false, 0);
+		ereport(LOG,
+				(errmsg("am_keys: encrypted %llu value(s) of %s.%s for tenant %s",
+						(unsigned long long) SPI_processed, table, column, tenant)));
+	}
+}
 
 /* One attempt, in its own transaction; any error is rolled back (500). */
 static void
@@ -179,6 +245,8 @@ amk_store_once(const char *json, AmkResult *r)
 								SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4),
 								SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5),
 								SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3))));
+				amk_encrypt_data(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6),
+								 SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3));
 			}
 			else if (r->users > 1)
 				amk_reply(r, 409, "AMBIGUOUS_USER",
@@ -397,7 +465,7 @@ AmKeysListenerMain(Datum main_arg)
 		int			ev;
 		pgsocket	conn;
 
-		ev = WaitLatchOrSocket(MyLatch, WL_LATCH_SET | WL_SOCKET_ACCEPT | WL_EXIT_ON_PM_DEATH,
+		ev = WaitLatchOrSocket(MyLatch, WL_LATCH_SET | WL_SOCKET_ACCEPT | WL_EXIT_ON_PM_DEATH,  /* socket pp */
 							   listener, -1, PG_WAIT_EXTENSION);
 		if (ev & WL_LATCH_SET)
 			ResetLatch(MyLatch);
