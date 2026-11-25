@@ -261,21 +261,3 @@ Then press Ctrl+C in the jar's window.
 
 **Expect:** `port 7000: stopped (python, PID ...)`, then `Done.`, and PostgreSQL stopped.
 
----
-
-## If a step fails
-
-| You see | Cause and fix |
-|---|---|
-| `oauth_tokens is missing` | `05_oauth.sql` was not loaded: `& 'D:\postgres-dev\install\bin\psql.exe' -U postgres -d erms -f 'D:\postgres-dev\merged\05_oauth.sql'` |
-| Login app shows `AM: http://127.0.0.1:8097` | `config.json` still points at the stub. Run step 0 again, or set `"am_url": ""`. |
-| `am_keys is not listening on port 7001` | `shared_preload_libraries = 'am_keys'` is missing in `data\postgresql.conf`, or `am_keys.dll` was not built (step 1). |
-| `Sign-in is unavailable: the AM could not deliver the keys` | The jar got `502 ASSET_DELIVERY_FAILED`. The secret in `application.yml` differs from `push_secret`, or am_keys isn't running. Restart the jar after changing `application.yml`. |
-| `Wrong tenant, username or password.` with the right password | The passwords were not set in the jar. Re-run step 3 and check its step 5. |
-| `No API key for tenant ...` | `api_key.<tenant_id>` is missing in `am_client.conf`. Re-run step 3. |
-| `Too many failed sign-ins` | Wait 15 minutes, or use another user. |
-| The jar stops with `Could not get Connection` | PostgreSQL isn't running. Run `start.bat` first, then the jar. |
-| WARNING `could not get the asset values from AM` in `server.log` | Harmless. The login hook asks the jar for values, but the jar sends them only in the login delivery. |
-
-When asking for help, send the output of the failing step and the last 20 lines of
-`D:\postgres-dev\data\server.log`.
